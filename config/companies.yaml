@@ -1,0 +1,29 @@
+# Replace these placeholders with real public job-board identifiers and set enabled: true.
+# Greenhouse: the token in boards.greenhouse.io/<token>
+# Lever: the site name in jobs.lever.co/<site-name>
+# Ashby: the board name in jobs.ashbyhq.com/<board-name>
+companies:
+  - name: Mind Robotics
+    source: ashby
+    identifier: mindrobotics
+    enabled: true
+  - name: Antares
+    source: ashby
+    identifier: antares
+    enabled: true
+  - name: Allen Control Systems
+    source: ashby
+    identifier: allen-control-systems
+    enabled: true
+  - name: Anduril Industries
+    source: greenhouse
+    identifier: andurilindustries
+    enabled: true
+  - name: Astranis
+    source: greenhouse
+    identifier: astranis
+    enabled: true
+  - name: Zoox
+    source: lever
+    identifier: zoox
+    enabled: true

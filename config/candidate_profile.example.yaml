@@ -1,0 +1,27 @@
+degree: "Bachelor of Science in Computer Engineering"
+
+expert_skills:
+  - "Python"
+  - "C++"
+  - "Git"
+  - "Linux"
+
+developing_skills:
+  - "Docker"
+  - "Embedded systems"
+  - "SQL"
+
+projects_and_technologies:
+  - "Python command-line applications"
+  - "SQLite databases"
+  - "REST APIs"
+  - "Automated testing with pytest"
+
+work_authorization: "Authorized to work in the United States"
+
+projects_and_technologies:
+  - name: "Example Project"
+    technologies:
+      - "Python"
+      - "SQLite"
+    description: "A generic example project."

@@ -1,0 +1,16 @@
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.pytest-tmp/
+.coverage
+htmlcov/
+data/*.db
+data/*.db-*
+data/*.sqlite*
+data/report.html
+data/calibration.csv
+*.log
+
+config/candidate_profile.yaml
+config/candidate_profile.yaml

@@ -1,0 +1,91 @@
+job_categories:
+  primary:
+    - Embedded Software Engineer
+    - Firmware Engineer
+    - Embedded Systems Engineer
+    - Systems Software Engineer
+    - Hardware Validation Engineer
+    - Hardware Test Engineer
+    - Systems Integration Engineer
+    - Robotics Firmware Engineer
+  stretch:
+    - Junior Design Verification Engineer
+    - ASIC Verification Engineer I
+    - FPGA Engineer I
+    - Digital Design Engineer I
+    - Silicon Validation Engineer
+  backup:
+    - C++ Software Engineer
+    - Computer Vision Engineer
+    - Robotics Software Engineer
+    - Manufacturing Test Engineer
+    - Applications Engineer
+
+# Short title signals catch legitimate variants that do not exactly match the titles above.
+job_category_keywords:
+  primary:
+    - embedded software
+    - embedded systems
+    - embedded linux
+    - firmware
+    - systems software
+    - hardware validation
+    - hardware test
+    - systems integration
+    - integration and test
+    - electronics test
+    - flight software
+  stretch:
+    - design verification
+    - asic verification
+    - fpga
+    - digital design
+    - silicon validation
+  backup:
+    - c++ software
+    - computer vision
+    - robotics software
+    - robotic software
+    - manufacturing test
+    - embedded products
+
+locations:
+  preferred_keywords: [San Francisco, Bay Area, California, CA, Remote, United States, US]
+  relocation_keywords: [relocation, relocation assistance, relocation available]
+  allow_remote_us: true
+
+employment:
+  preferred: [full-time, full time]
+  acceptable: [internship, intern, contract-to-hire, contract to hire]
+
+eligibility:
+  reject_seniority_keywords: [senior, sr, staff, principal, lead, manager, director, chief, head, vice president, vp]
+  unrelated_title_keywords: [frontend, front-end, full stack, full-stack, backend, web developer, web designer, ui engineer, android engineer, sales, account executive, help desk, help-desk, it support, legal counsel, recruiter, human resources, facilities, warehouse, supply chain, business operations, finance, accountant, marketing]
+  entry_level_keywords: [entry level, entry-level, junior, associate, new grad, new graduate, engineer i, engineer ii, internship, intern]
+  reject_experience_years: 5
+  flag_experience_years: 2
+  allow_experience_override: false
+
+scoring:
+  weights:
+    fit: 0.40
+    competitiveness: 0.25
+    preference: 0.20
+    recency: 0.15
+  recommendation_thresholds:
+    apply_immediately: 80
+    good_match: 65
+    stretch_application: 45
+  recency_full_score_days: 7
+  recency_zero_score_days: 90
+
+follow_up:
+  minimum_business_days: 5
+  urgent_business_days: 8
+  late_business_days: 12
+  stale_business_days: 15
+  max_unsolicited_follow_ups: 1
+  allow_second_follow_up: false
+  follow_up_spacing_business_days: 5
+  # Optional YYYY-MM-DD values; weekends are always excluded automatically.
+  holidays: []
