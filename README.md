@@ -1,12 +1,40 @@
-# Job Ranker
+# JobBot
 
-Job Ranker is a local Python command-line application that fetches public job postings from configured Greenhouse, Lever, and Ashby boards, normalizes them, ranks them against a candidate profile, and saves the results in SQLite. It produces a simple static HTML report and tracks application status.
+JobBot is a local Python command-line tool for discovering and prioritizing public job postings. It collects jobs from configured company boards, normalizes and deduplicates them, scores each role against a locally configured candidate profile and preferences, stores the results in SQLite, and provides workflows for reviewing jobs, tracking applications, and planning follow-ups.
 
-It intentionally does **not** submit applications, log in to job sites, scrape LinkedIn or Indeed, generate resumes, send email, use browser automation, or use an LLM. Scores are ranking heuristics—not probabilities of receiving an offer.
+JobBot is decision support, not an application bot. It does not submit applications, sign in to job sites, scrape LinkedIn or Indeed, send messages, or use an LLM. Its scores are transparent ranking heuristics, not predictions of an offer.
 
-## Windows setup
+## Supported job sources
 
-From PowerShell in the project folder, create and activate a virtual environment:
+JobBot includes collectors for the public job-board APIs used by:
+
+- Greenhouse
+- Lever
+- Ashby
+
+Add enabled boards to `config/companies.yaml` using the identifier from the company's public careers URL:
+
+```yaml
+companies:
+  - name: Example Robotics
+    source: greenhouse
+    identifier: example-robotics
+    enabled: true
+  - name: Example Systems
+    source: lever
+    identifier: example-systems
+    enabled: true
+  - name: Example Automation
+    source: ashby
+    identifier: example-automation
+    enabled: true
+```
+
+Only public endpoints are used; no API keys or login credentials belong in this configuration.
+
+## Setup
+
+From PowerShell in the project directory:
 
 ```powershell
 py -3.11 -m venv .venv
@@ -14,151 +42,55 @@ Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
 .\.venv\Scripts\Activate.ps1
 python -m pip install --upgrade pip
 python -m pip install -r requirements.txt
+Copy-Item config\candidate_profile.example.yaml config\candidate_profile.yaml
 ```
 
-The temporary execution-policy command is only needed if PowerShell blocks the activation script. It affects the current PowerShell process only.
+Edit the copied candidate profile, `config/preferences.yaml`, and `config/companies.yaml`. The real `config/candidate_profile.yaml` is ignored by Git; the tracked example contains generic placeholder data only.
 
-## Configure your profile and preferences
-
-The supplied files are ready to edit:
-
-- `config/candidate_profile.yaml` lists established skills, developing skills, degree keywords, and project themes.
-- `config/preferences.yaml` contains categories, locations, employment preferences, eligibility rules, scoring weights, and recommendation thresholds.
-- `config/companies.yaml` lists public job boards to scan.
-
-Configuration is YAML, so preserve indentation and use spaces rather than tabs.
-
-### Add companies
-
-Replace or copy a placeholder entry in `config/companies.yaml`, provide its real identifier, and set `enabled: true`.
-
-```yaml
-companies:
-  - name: A Greenhouse Company
-    source: greenhouse
-    identifier: company-token
-    enabled: true
-  - name: A Lever Company
-    source: lever
-    identifier: company-site-name
-    enabled: true
-  - name: An Ashby Company
-    source: ashby
-    identifier: company-board-name
-    enabled: true
-```
-
-Find public identifiers in the company careers URL:
-
-- Greenhouse: `boards.greenhouse.io/<company-token>`
-- Lever: `jobs.lever.co/<company-site-name>`
-- Ashby: `jobs.ashbyhq.com/<company-board-name>`
-
-Only public APIs are called. No credentials should be added to these files.
-
-## Use the application
-
-Initialize the SQLite database:
+Initialize the local database once:
 
 ```powershell
 python app.py init-db
 ```
 
-Fetch enabled boards, deduplicate, score, and store postings:
+## Typical workflow
+
+Scan enabled boards, review the ranked results, inspect a job, and record an application:
 
 ```powershell
 python app.py scan
-python app.py scan --force-detail-refresh
-```
-
-The intended daily workflow starts with a scan and a concise decision-support view:
-
-```powershell
-python app.py scan
-python app.py daily
-```
-
-Then inspect and record actions explicitly:
-
-```powershell
-python app.py show JOB_ID
-python app.py update-status JOB_ID applied
-python app.py update-status JOB_ID applied --date 2026-08-07
-python app.py follow-ups
-python app.py record-follow-up JOB_ID --contact CONTACT_ID --method email --note "Sent brief follow-up"
-```
-
-List the highest-ranked jobs first, optionally with a cutoff:
-
-```powershell
 python app.py list
+python app.py top
+python app.py top --limit 10
+python app.py show 123
+python app.py update-status 123 applied
+```
+
+`top` defaults to the five highest-ranked actionable jobs. It shows the same detailed scoring breakdown as `show` for each result and excludes inactive postings, ineligible jobs, and jobs whose application status has progressed beyond `not reviewed` or `saved`.
+
+Other useful listing commands include:
+
+```powershell
 python app.py list --minimum-score 70
 python app.py list --new --limit 25
-python app.py list --company Zoox --category firmware
+python app.py list --company "Example Robotics"
+python app.py list --category firmware
 python app.py list --recommendation "Apply immediately"
+python app.py list --inactive
 ```
 
-Lists show active jobs by default and return at most 50 rows. Use `--inactive` to inspect closed jobs. Filters can be combined. A posting remains active after its first missing successful company scan and is marked inactive after its second consecutive miss; collector failures do not count as misses.
+Active jobs are listed by default. A posting is marked inactive after it is absent from two successful scans of its company board; collector failures do not count as misses.
 
-Inspect the full deterministic score breakdown:
+## Ranking and scoring
 
-```powershell
-python app.py show 12
-```
+Every scored job receives four independent scores from 0 to 100:
 
-Generate a static report at `data/report.html`:
+- Fit: skill overlap, title category, project technologies, degree relevance, and qualifications.
+- Competitiveness: required-skill coverage, requested experience, early-career signals, and preferred-skill gaps.
+- Preference: preferred categories, location, remote status, employment type, and avoided roles.
+- Recency: full credit for recently posted jobs, declining toward zero at 90 days; an unknown date receives a neutral score.
 
-```powershell
-python app.py report
-Invoke-Item .\data\report.html
-```
-
-Update a job using the numeric ID shown by `list`:
-
-```powershell
-python app.py update-status 12 applied
-python app.py update-status 12 "technical interview"
-```
-
-The first `applied` update records the application timestamp. Moving to another status and back does not replace the original date. Existing applied records whose date predates this feature remain unknown until manually backfilled with `--date`.
-
-Optional contacts are entered manually; the application does not scrape LinkedIn, discover personal email addresses, or infer addresses from names:
-
-```powershell
-python app.py add-contact 12 --name "Jane Doe" --type recruiter --email "jane@example.com" --verified
-python app.py follow-ups --due --limit 10
-python app.py follow-ups --all --company Zoox
-```
-
-Follow-up recommendations use business days, application age, the original priority score, review state, posting state, contact quality, and recorded follow-up history. They are deterministic decision support—not probabilities or evidence that contacting someone will improve an application's outcome. No command sends email, LinkedIn messages, or any other communication.
-
-Record ranking relevance separately from application status:
-
-```powershell
-python app.py review 12 strong-match --note "Strong MCU and RTOS overlap"
-python app.py review 15 possible
-python app.py review 18 poor-match
-python app.py review 20 irrelevant
-```
-
-Export active jobs scoring at least 65 to `data/calibration.csv`:
-
-```powershell
-python app.py export-calibration
-```
-
-Supported statuses are Not reviewed, Saved, Applied, Rejected, Recruiter screen, Technical interview, Final interview, Offer, No response, Skipped, and Withdrawn. The application stores data in `data/jobs.db` by default. Use global options before the command to choose another location, for example `python app.py --database data/test.db init-db`.
-
-## How scoring works
-
-Each job receives four independent 0–100 scores:
-
-- **Fit** combines skill overlap, title category, project technologies, degree relevance, and qualifications.
-- **Competitiveness** considers required-skill coverage, requested experience, entry-level/new-graduate signals, and preferred-skill gaps.
-- **Preference** considers primary/stretch/backup category, location, remote status, employment type, and avoided roles.
-- **Recency** declines from full credit for postings at most seven days old toward zero at 90 days. An unknown posting date receives a conservative neutral score.
-
-The combined score is:
+The default combined score is:
 
 ```text
 priority_score =
@@ -168,30 +100,89 @@ priority_score =
   + 0.15 * recency_score
 ```
 
-Transparent eligibility rules reject obvious leadership and unrelated roles and roles asking for five or more years by default. Requests for two to three years are flagged rather than rejected. These values and keywords can be changed in `preferences.yaml`. Rejected roles are retained with a low score and a Skip recommendation so the decision remains inspectable.
+Eligibility rules separately flag or exclude roles based on configurable experience, citizenship, export-control, clearance, leadership, and unrelated-role criteria. Scoring and extraction are deterministic and rule-based. Always read the original posting before applying.
 
-Skill extraction is deliberately conservative and rule-based. Public APIs do not consistently distinguish required from preferred qualifications, so Job Ranker uses nearby wording such as “preferred,” “nice to have,” and “bonus.” Always read the original posting before applying.
+Use `show` for the complete score, matched and missing skills, eligibility evidence, posting summary, and application URL:
+
+```powershell
+python app.py show 123
+```
+
+## Application status tracking
+
+JobBot tracks these statuses: `not reviewed`, `saved`, `applied`, `rejected`, `recruiter screen`, `technical interview`, `final interview`, `offer`, `no response`, `skipped`, and `withdrawn`.
+
+Update a job by its numeric ID:
+
+```powershell
+python app.py update-status 123 saved
+python app.py update-status 123 applied
+python app.py update-status 123 applied --date 2026-08-01
+python app.py update-status 123 "technical interview"
+```
+
+The first `applied` update records the application timestamp. An explicit `--date` can backfill the original application date.
+
+The `applications` command lists every job whose status has changed from `not reviewed`, newest activity first. It supports exact status and case-insensitive partial company filters:
+
+```powershell
+python app.py applications
+python app.py applications --status applied
+python app.py applications --company "Allen Control Systems"
+```
+
+## Follow-up tracking
+
+Contacts and follow-ups are entered manually. JobBot never discovers contact details or sends communications.
+
+```powershell
+python app.py add-contact 123 --name "Example Recruiter" --type recruiter --email "recruiter@example.com" --verified
+python app.py follow-ups
+python app.py follow-ups --due --limit 10
+python app.py follow-ups --all --company "Example Robotics"
+python app.py record-follow-up 123 --contact 1 --method email --note "Sent a brief follow-up"
+python app.py update-status 123 applied --do-not-follow-up
+```
+
+Follow-up recommendations consider business days since applying, application and posting state, original priority, contact quality, suppression settings, and prior follow-up history. `daily` combines application priorities, due follow-ups, and statuses needing attention:
+
+```powershell
+python app.py daily
+python app.py daily --target 5
+```
+
+## Calibration and reports
+
+Record relevance feedback independently of application status:
+
+```powershell
+python app.py review 123 strong-match --note "Strong overlap with the role"
+python app.py review 124 possible
+python app.py review 125 poor-match
+python app.py review 126 irrelevant
+```
+
+Export active jobs scoring at least 65 for offline calibration, or create a local static HTML report:
+
+```powershell
+python app.py export-calibration
+python app.py export-calibration --output data\calibration.csv
+python app.py report
+Invoke-Item .\data\report.html
+```
+
+The default database, report, and calibration export under `data/` are ignored by Git because they may contain private job-search data.
+
+## Reliability and limitations
+
+Scans use configurable timeouts and bounded retries. Greenhouse detail inspection is parallelized and cached; incomplete detail requests retain the board posting for manual eligibility review. Run `python app.py scan --help` for reliability controls, including detail timeout, worker, retry, refresh, and board-timeout options.
+
+Descriptions from job boards are converted from untrusted HTML to plain text, and report output is HTML-escaped. Current limitations include manually configured board identifiers, inconsistent source fields, heuristic text extraction, and no scheduler, graphical interface, notifications, or automatic application submission.
 
 ## Tests
 
-All network behavior is mocked; the test suite does not depend on live job boards.
+The test suite mocks network behavior and does not require live job boards:
 
 ```powershell
 python -m pytest
 ```
-
-## Reliability and safety
-
-HTTP calls have configurable timeouts and bounded retries. Greenhouse detail failures retain the board posting for manual eligibility review, while successful eligibility inspections are cached until the posting changes. Use `--detail-timeout`, `--detail-workers`, `--detail-retries`, `--detail-retry-interval`, and `--detail-board-timeout` to tune scans. Errors are logged and scanning continues with the next configured company. Descriptions are converted from untrusted HTML to plain text, and all report content is HTML-escaped. The report does not execute posting markup. Job Ranker stores no login credentials and never submits applications.
-
-## Current limitations
-
-- Company board identifiers must be added manually.
-- API fields differ, so employment type, salary, and posting date may be unavailable.
-- Qualification and experience extraction relies on text patterns and can miss unusual wording.
-- A posting edited at its source is rescored, but this MVP does not preserve an edit history.
-- There is no scheduler, graphical interface, or automatic notification.
-
-## Suggested improvements
-
-Useful next steps include richer skill aliases, better qualification-section parsing, configurable API retries with backoff, saved searches, CSV export, archival of closed jobs, a scheduled Windows Task Scheduler command, and a small local dashboard. Automatic application submission should remain out of scope unless designed as a separate, explicitly controlled system.

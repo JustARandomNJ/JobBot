@@ -27,6 +27,14 @@ DEFAULT_DATABASE = ROOT / "data" / "jobs.db"
 DEFAULT_REPORT = ROOT / "data" / "report.html"
 DEFAULT_CALIBRATION = ROOT / "data" / "calibration.csv"
 COLLECTORS = {"greenhouse": GreenhouseCollector, "lever": LeverCollector, "ashby": AshbyCollector}
+ACTIONABLE_APPLICATION_STATUSES = {"not reviewed", "saved"}
+
+
+def positive_int(value: str) -> int:
+    parsed = int(value)
+    if parsed < 1:
+        raise argparse.ArgumentTypeError("must be at least 1")
+    return parsed
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -57,6 +65,8 @@ def build_parser() -> argparse.ArgumentParser:
     eligibility.add_argument("--eligible", action="store_const", const="eligible", dest="eligibility")
     eligibility.add_argument("--manual-eligibility-review", action="store_const", const="manual_review", dest="eligibility")
     eligibility.add_argument("--ineligible", action="store_const", const="ineligible", dest="eligibility")
+    top = commands.add_parser("top", help="Show the highest-ranked actionable jobs")
+    top.add_argument("--limit", type=positive_int, default=5)
     show = commands.add_parser("show", help="Show a complete scoring breakdown")
     show.add_argument("job_id", type=int)
     report = commands.add_parser("report", help="Write a local static HTML report")
@@ -204,6 +214,20 @@ def list_jobs(database: Database, args: argparse.Namespace) -> None:
     print(f"{'ID':>5}  {'Pri':>5} {'Fit':>5} {'Comp':>5} {'Pref':>5} {'Rec':>5}  {'Eligibility':<24} Company - Title")
     for row in rows:
         print(f"{row['id']:>5}  {row['priority_score']:>5.1f} {row['fit_score']:>5.1f} {row['competitiveness_score']:>5.1f} {row['preference_score']:>5.1f} {row['recency_score']:>5.1f}  {row['defense_eligibility_status']:<24} {row['company']} - {row['title']}")
+
+
+def top_jobs(database: Database, limit: int) -> None:
+    rows = database.list_ranked_jobs(
+        active=True, limit=limit, eligibility="not_ineligible",
+        statuses=ACTIONABLE_APPLICATION_STATUSES,
+    )
+    total = len(rows)
+    for rank, row in enumerate(rows, start=1):
+        if rank > 1:
+            print()
+        print(f"===== #{row['id']} | Rank {rank}/{total} =====")
+        print()
+        show_job(row)
 
 
 def list_applications(database: Database, args: argparse.Namespace) -> None:
@@ -379,6 +403,9 @@ def main(argv: list[str] | None = None) -> int:
     elif args.command == "list":
         database.initialize()
         list_jobs(database, args)
+    elif args.command == "top":
+        database.initialize()
+        top_jobs(database, args.limit)
     elif args.command == "applications":
         database.initialize()
         list_applications(database, args)

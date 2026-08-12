@@ -367,7 +367,7 @@ class Database:
         self, minimum_score: float = 0, *, active: bool | None = True,
         new_only: bool = False, company: str | None = None, category: str | None = None,
         recommendation: str | None = None, limit: int | None = 50,
-        eligibility: str | None = None,
+        eligibility: str | None = None, statuses: set[str] | None = None,
     ) -> list[dict[str, Any]]:
         clauses = ["s.priority_score >= ?"]
         params: list[Any] = [minimum_score]
@@ -385,6 +385,10 @@ class Database:
         if recommendation:
             clauses.append("lower(s.recommendation) = ?")
             params.append(recommendation.lower())
+        if statuses:
+            placeholders = ", ".join("?" for _ in statuses)
+            clauses.append(f"a.status IN ({placeholders})")
+            params.extend(sorted(statuses))
         if eligibility == "eligible":
             clauses.append("s.defense_eligibility_status IN ('eligible', 'no_special_requirement')")
         elif eligibility == "manual_review":
