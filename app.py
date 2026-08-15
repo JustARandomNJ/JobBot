@@ -17,6 +17,9 @@ from collectors import AshbyCollector, GreenhouseCollector, LeverCollector
 from config_loader import load_configuration
 from ranking.scorer import score_job
 from ranking.posting_health import freshness_score, repost_risk
+from ranking.evidence import extract_requirements, map_evidence
+from ranking.company import saturation
+from config_loader import load_yaml
 from ranking.follow_up import add_business_days, rank_follow_ups
 from reports.html_report import generate_report
 from storage.database import (Database, VALID_CONTACT_TYPES, VALID_FOLLOW_UP_METHODS,
@@ -70,6 +73,10 @@ def build_parser() -> argparse.ArgumentParser:
     top.add_argument("--limit", type=positive_int, default=5)
     show = commands.add_parser("show", help="Show a complete scoring breakdown")
     show.add_argument("job_id", type=int)
+    package = commands.add_parser("package", help="Build a deterministic application package")
+    package.add_argument("job_id", type=int)
+    effort = commands.add_parser("set-effort", help="Set estimated application minutes")
+    effort.add_argument("job_id", type=int); effort.add_argument("minutes", type=positive_int)
     report = commands.add_parser("report", help="Write a local static HTML report")
     report.add_argument("--output", type=Path, default=DEFAULT_REPORT)
     status = commands.add_parser("update-status", help="Update application workflow status")
@@ -360,6 +367,33 @@ def show_job(job: dict[str, Any]) -> None:
     print(f"Apply URL: {job['apply_url']}")
 
 
+def application_package(database: Database, job: dict[str, Any], config_dir: Path) -> None:
+    profile, _, _ = load_configuration(config_dir)
+    requirements = extract_requirements(job["title"], job["description"], job.get("required_skills"))
+    coverage = map_evidence(requirements, profile)
+    variants_path = config_dir / "resume_variants.yaml"
+    variants = load_yaml(variants_path).get("resumes", {}) if variants_path.exists() else {}
+    resume = next((value.get("path") for value in variants.values()
+                   if job.get("role_family") in value.get("role_families", [])), None)
+    company_history = saturation(database.company_applications(job["company"]))
+    print("APPLICATION PACKAGE")
+    print(f"\nJob: {job['company']} - {job['title']}")
+    print(f"Company: {job['company']}\nRole family: {job.get('role_family', 'other')}")
+    print(f"\nRecommended resume: {resume or 'No matching resume variant configured'}")
+    print("\nStrongest candidate evidence:")
+    for item in coverage:
+        if item["state"] in {"strong_evidence", "related_evidence"}:
+            print(f"  - {item['requirement']}: {item['evidence']} ({item['state']})")
+    print("\nImportant JD keywords: " + (", ".join(requirements) or "None detected"))
+    gaps = [item["requirement"] for item in coverage if item["state"] == "no_profile_evidence"]
+    print("Possible gaps: " + (", ".join(gaps) or "None detected"))
+    print(f"Eligibility: {job.get('eligibility_status', 'unknown').upper()}")
+    print(f"Application effort: {job.get('estimated_effort_minutes') or 'unknown'}" + (" minutes" if job.get('estimated_effort_minutes') else ""))
+    print(f"Company saturation: {company_history['level'].upper()}")
+    if company_history["warning"]:
+        print(f"Warning: {company_history['warning']}")
+
+
 def export_calibration(database: Database, output: Path) -> int:
     jobs = database.list_ranked_jobs(65, active=True, limit=None)
     fields = [
@@ -440,6 +474,19 @@ def main(argv: list[str] | None = None) -> int:
             print(f"Job {args.job_id} was not found.", file=sys.stderr)
             return 1
         show_job(job)
+    elif args.command == "package":
+        database.initialize(); job = database.get_job(args.job_id)
+        if job is None:
+            print(f"Job {args.job_id} was not found.", file=sys.stderr); return 1
+        application_package(database, job, args.config_dir)
+    elif args.command == "set-effort":
+        database.initialize()
+        try:
+            if not database.set_effort(args.job_id, args.minutes):
+                print(f"Job {args.job_id} was not found.", file=sys.stderr); return 1
+        except ValueError as exc:
+            print(str(exc), file=sys.stderr); return 2
+        print(f"Set estimated application effort for job {args.job_id} to {args.minutes} minutes.")
     elif args.command == "report":
         database.initialize()
         followups = follow_up_rows(database, args.config_dir)

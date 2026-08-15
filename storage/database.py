@@ -281,6 +281,7 @@ class Database:
                 "do_not_follow_up": "INTEGER NOT NULL DEFAULT 0",
                 "application_date_unknown": "INTEGER NOT NULL DEFAULT 0",
                 "skip_reason": "TEXT",
+                "estimated_effort_minutes": "INTEGER",
             },
         }
         for table, columns in migrations.items():
@@ -478,7 +479,7 @@ class Database:
             params.append(limit)
         with self.connect() as connection:
             rows = connection.execute(
-                f"""SELECT j.*, s.*, a.status,a.skip_reason,a.applied_at,a.last_follow_up_at,a.follow_up_count,
+                f"""SELECT j.*, s.*, a.status,a.skip_reason,a.estimated_effort_minutes,a.applied_at,a.last_follow_up_at,a.follow_up_count,
                           a.next_follow_up_at,a.do_not_follow_up,r.relevance, r.note AS review_note,
                           (SELECT max(id) FROM scan_history WHERE completed_at IS NOT NULL) AS latest_scan_id
                    FROM jobs j
@@ -496,7 +497,7 @@ class Database:
     def get_job(self, job_id: int) -> dict[str, Any] | None:
         with self.connect() as connection:
             row = connection.execute(
-                """SELECT j.*, s.*, a.status,a.skip_reason,a.applied_at,a.last_follow_up_at,a.follow_up_count,
+                """SELECT j.*, s.*, a.status,a.skip_reason,a.estimated_effort_minutes,a.applied_at,a.last_follow_up_at,a.follow_up_count,
                           a.next_follow_up_at,a.do_not_follow_up,r.relevance, r.note AS review_note,
                           (SELECT count(*) FROM job_observations o WHERE o.job_id=j.id) AS times_seen,
                           (SELECT count(*) FROM job_observations o WHERE o.job_id=j.id AND o.reopened=1) AS reopened_count,
@@ -656,6 +657,25 @@ class Database:
                 (job_id, normalized, datetime.now(timezone.utc).isoformat()),
             )
             return cursor.rowcount == 1
+
+    def set_effort(self, job_id: int, minutes: int) -> bool:
+        if minutes < 1:
+            raise ValueError("Application effort must be at least one minute.")
+        with self.connect() as connection:
+            cursor = connection.execute(
+                "UPDATE application_status SET estimated_effort_minutes=?,updated_at=? WHERE job_id=?",
+                (minutes, datetime.now(timezone.utc).isoformat(), job_id),
+            )
+            return cursor.rowcount == 1
+
+    def company_applications(self, company: str) -> list[dict[str, Any]]:
+        with self.connect() as connection:
+            rows = connection.execute(
+                """SELECT a.status,a.applied_at,s.role_family FROM application_status a
+                   JOIN jobs j ON j.id=a.job_id LEFT JOIN job_scores s ON s.job_id=j.id
+                   WHERE lower(j.company)=lower(?) AND a.status NOT IN ('not reviewed','saved','skipped')""", (company,),
+            ).fetchall()
+        return [dict(row) for row in rows]
 
     def add_contact(self, job_id: int, *, name: str, contact_type: str, role_title: str | None = None,
                     email: str | None = None, profile_url: str | None = None,

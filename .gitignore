@@ -14,4 +14,5 @@ data/backups/
 *.log
 
 config/candidate_profile.yaml
-config/candidate_profile.yaml
+config/resume_variants.yaml
+resumes/
