@@ -31,6 +31,13 @@ def test_ambiguous_clearance_is_manual_review():
     assert score.eligibility_status == "manual_review"
 
 
+def test_hard_experience_cutoff_is_ineligible():
+    score = score_job(Job(title="Engineer", description="Requires extensive experience", required_experience_years=5),
+                      {}, {"eligibility": {"reject_experience_years": 5}})
+    assert score.eligibility_status == "ineligible"
+    assert score.eligibility_reasons[0]["code"] == "experience_requirement"
+
+
 def test_skip_reason_validation_and_storage(tmp_path):
     db = Database(tmp_path / "jobs.db")
     db.initialize()

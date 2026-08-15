@@ -230,6 +230,8 @@ def evaluate_eligibility(job: Job, preferences: dict[str, Any], profile: dict[st
     hard: list[tuple[str, str, str]] = []
     combined = re.sub(r"\s+", " ", f"{job.title}. {job.description}")
     candidate_profile = profile or {}
+    if years is not None and years >= float(config.get("reject_experience_years", 5)) and not config.get("allow_experience_override", False):
+        hard.append(("ineligible", "experience_requirement", f"Position requires {years:g}+ years of experience."))
     current_student = candidate_profile.get("current_student")
     graduation = str(candidate_profile.get("graduation_date", ""))
     degree = candidate_profile.get("degree")

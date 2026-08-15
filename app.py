@@ -48,10 +48,11 @@ def contextualize_priority(database: Database, job_id: int, job: Any, score: Any
         observations = connection.execute("SELECT count(*),sum(reopened),sum(description_changed) FROM job_observations WHERE job_id=?", (job_id,)).fetchone()
     effort = application[0] if application else None
     effort_value = None if effort is None else 90.0 if effort <= 15 else 70.0 if effort <= 30 else 45.0 if effort <= 60 else 20.0
-    _, band = freshness_score(job.date_posted, preferences.get("posting_health", {}))
     health_value = 50.0
     if observations and observations[0]:
-        risk, _ = repost_risk(age_days=None, reopened_count=observations[1] or 0,
+        discovered = job.date_discovered if job.date_discovered.tzinfo else job.date_discovered.replace(tzinfo=timezone.utc)
+        observed_age = max(0.0, (datetime.now(timezone.utc) - discovered).total_seconds() / 86400)
+        risk, _ = repost_risk(age_days=observed_age, reopened_count=observations[1] or 0,
                               times_seen=observations[0], description_changes=observations[2] or 0,
                               thresholds=preferences.get("posting_health", {}))
         health_value = {"low": 85.0, "moderate": 55.0, "high": 20.0}[risk]
@@ -199,16 +200,21 @@ def scan(database: Database, config_dir: Path, *, force_detail_refresh: bool = F
             fetched += len(jobs)
             seen_job_ids: set[int] = set()
             company_saved = company_updated = 0
+            contextual_jobs: list[tuple[int, Any, Any]] = []
             with database.connect() as connection:
                 for job in jobs:
                     job_id, created = database.upsert_job(job, scan_id=scan_id, connection=connection)
                     seen_job_ids.add(job_id)
-                    database.save_score(job_id, score_job(job, profile, preferences), connection=connection)
+                    scored = score_job(job, profile, preferences)
+                    database.save_score(job_id, scored, connection=connection)
+                    contextual_jobs.append((job_id, job, scored))
                     company_saved += int(created)
                     company_updated += int(not created)
                 company_inactive = database.reconcile_company_scan(
                     company_name, source, seen_job_ids, connection=connection
                 )
+            for job_id, job, scored in contextual_jobs:
+                database.save_score(job_id, contextualize_priority(database, job_id, job, scored, profile, preferences))
             saved += company_saved
             updated += company_updated
             newly_inactive += company_inactive
@@ -559,6 +565,11 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"Job {args.job_id} was not found.", file=sys.stderr); return 1
         except ValueError as exc:
             print(str(exc), file=sys.stderr); return 2
+        profile, preferences, _ = load_configuration(args.config_dir)
+        stored_job = next((job for job_id, job in database.all_jobs() if job_id == args.job_id), None)
+        if stored_job is not None:
+            rescored = score_job(stored_job, profile, preferences)
+            database.save_score(args.job_id, contextualize_priority(database, args.job_id, stored_job, rescored, profile, preferences))
         print(f"Set estimated application effort for job {args.job_id} to {args.minutes} minutes.")
     elif args.command == "analytics":
         database.initialize(); print_analytics(database)
