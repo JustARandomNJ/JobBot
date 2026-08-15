@@ -53,3 +53,15 @@ def test_generic_engineer_titles_do_not_inherit_specialized_categories() -> None
         score = score_job(job, PROFILE, PREFERENCES, now=now)
         assert score.preference_score <= 25
         assert score.priority_score < 70
+
+
+def test_string_degree_profile_is_supported() -> None:
+    score = score_job(Job(title="Engineer", description="Bachelor of Science in Computer Engineering"),
+                      {"degree": "Bachelor of Science in Computer Engineering"}, {"eligibility": {}})
+    assert score.fit_score > 0
+
+
+def test_structured_projects_are_supported() -> None:
+    profile = {"projects_and_technologies": [{"name": "Vehicle", "technologies": ["CAN", "RTOS"]}]}
+    score = score_job(Job(title="Firmware Engineer", description="CAN RTOS firmware"), profile, {"eligibility": {}})
+    assert score.fit_score > 0

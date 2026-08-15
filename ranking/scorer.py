@@ -17,6 +17,16 @@ def _clamp(value: float) -> float:
     return round(max(0.0, min(100.0, value)), 1)
 
 
+def _profile_terms(value: Any) -> list[str]:
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, list):
+        return [term for item in value for term in _profile_terms(item)]
+    if isinstance(value, dict):
+        return [term for item in value.values() for term in _profile_terms(item)]
+    return []
+
+
 def _category(job: Job, preferences: dict[str, Any]) -> tuple[str | None, float]:
     title = job.title.lower()
     for name, score in (("primary", 100.0), ("stretch", 78.0), ("backup", 68.0)):
@@ -93,9 +103,10 @@ def score_job(job: Job, profile: dict[str, Any], preferences: dict[str, Any], no
     eligibility = evaluate_eligibility(job, preferences, profile)
     match = match_skills(job, profile)
     category, category_score = _category(job, preferences)
-    degree_terms = profile.get("degree", {}).get("keywords", [])
+    configured_degree = profile.get("degree", {})
+    degree_terms = configured_degree.get("keywords", []) if isinstance(configured_degree, dict) else [str(configured_degree)]
     degree_relevance = 100.0 if any(term.lower() in job.description.lower() for term in degree_terms) else 55.0
-    project_terms = profile.get("projects_and_technologies", [])
+    project_terms = _profile_terms(profile.get("projects_and_technologies", []))
     project_hits = sum(term.lower() in job.description.lower() for term in project_terms)
     project_score = min(100.0, project_hits * 20.0)
     fit = _clamp(0.55 * match.weighted_score + 0.25 * category_score + 0.10 * degree_relevance + 0.10 * project_score)
