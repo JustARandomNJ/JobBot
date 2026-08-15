@@ -11,6 +11,11 @@ ALIASES = {
     "i2c": ("i²c",), "device drivers": ("device driver", "linux drivers"),
     "verilog": ("rtl verilog",), "linux": ("embedded linux",),
 }
+RELATED = {
+    "linux": ("yocto", "buildroot"),
+    "fpga": ("programmable logic", "vivado", "quartus"),
+    "verilog": ("systemverilog",),
+}
 KNOWN_REQUIREMENTS = ("C", "C++", "SystemVerilog", "CAN", "RTOS", "SPI", "I2C", "UART", "Linux",
                       "device drivers", "Yocto", "UVM", "SVA", "RTL", "FPGA", "Verilog", "Python")
 
@@ -60,7 +65,11 @@ def map_evidence(requirements: list[str], profile: dict[str, Any]) -> list[dict[
                 state, evidence = candidate_state, hit[1] or hit[0]
                 break
         if state == "no_profile_evidence":
-            related = next(((text, label) for text, label in expert + projects if requirement.lower() in text.lower() or text.lower() in requirement.lower()), None)
+            # Related evidence must be an explicit semantic relationship. Raw
+            # substring containment made one-letter skills (notably C) evidence
+            # for I2C, CAN, and "device drivers".
+            related = next(((text, label) for text, label in expert + projects
+                            if any(_matches(term, text) for term in RELATED.get(requirement.lower(), ()))), None)
             if related:
                 state, evidence = "related_evidence", related[1] or related[0]
         output.append({"requirement": requirement, "state": state, "evidence": evidence})

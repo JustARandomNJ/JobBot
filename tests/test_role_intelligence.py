@@ -19,6 +19,20 @@ def test_role_families_are_deterministic():
         assert classify_role(Job(title=title, description=description)).role_family == expected
 
 
+def test_real_world_title_patterns_classify_without_company_special_cases():
+    cases = [
+        ("Embedded Software Engineer - MCU Platforms", "microcontroller C RTOS", "embedded_firmware"),
+        ("Embedded Software Engineer - Body Systems", "embedded controllers and CAN bus", "embedded_firmware"),
+        ("Firmware Engineer I-II", "low-level firmware", "firmware"),
+        ("Early Career Firmware Engineer", "firmware development", "firmware"),
+        ("FPGA Engineer", "", "fpga"),
+        ("Embedded Software Engineer", "Linux on NVIDIA Jetson with device drivers", "bsp_drivers"),
+        ("Computer Vision & Machine Learning, Associate", "", "computer_vision_ml"),
+    ]
+    for title, description, expected in cases:
+        assert classify_role(Job(title=title, description=description)).role_family == expected
+
+
 def test_student_only_candidate_is_ineligible():
     score = score_job(Job(title="Firmware Intern", description="Applicants must be currently enrolled university students."),
                       {"current_student": False}, {"eligibility": {}})
@@ -36,6 +50,22 @@ def test_hard_experience_cutoff_is_ineligible():
                       {}, {"eligibility": {"reject_experience_years": 5}})
     assert score.eligibility_status == "ineligible"
     assert score.eligibility_reasons[0]["code"] == "experience_requirement"
+
+
+def test_realistic_student_and_graduation_gates_are_not_unknown():
+    profile = {"current_student": False, "work_authorization": {"authorized_in_us": True}}
+    internship = score_job(Job(
+        title="Flight Software Associate (Fall 2026)",
+        description="Applicants must be currently enrolled and graduate between December 2026 and June 2027.",
+    ), profile, {"eligibility": {}})
+    assert internship.eligibility_status == "ineligible"
+    assert {reason["code"] for reason in internship.eligibility_reasons} >= {"student_only", "graduation_window"}
+
+    ambiguous = score_job(Job(
+        title="Flight Software Associate",
+        description="Candidates must graduate between December 2026 and June 2027.",
+    ), {"work_authorization": {"authorized_in_us": True}}, {"eligibility": {}})
+    assert ambiguous.eligibility_status == "manual_review"
 
 
 def test_skip_reason_validation_and_storage(tmp_path):

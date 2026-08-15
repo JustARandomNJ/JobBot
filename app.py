@@ -15,7 +15,7 @@ import requests
 
 from collectors import AshbyCollector, GreenhouseCollector, LeverCollector
 from config_loader import load_configuration
-from ranking.scorer import score_job
+from ranking.scorer import ANALYSIS_VERSION, score_job
 from ranking.posting_health import freshness_score, repost_risk
 from ranking.evidence import extract_requirements, map_evidence
 from ranking.company import saturation
@@ -38,15 +38,23 @@ ACTIONABLE_APPLICATION_STATUSES = {"not reviewed", "saved"}
 
 
 def contextualize_priority(database: Database, job_id: int, job: Any, score: Any,
-                           profile: dict[str, Any], preferences: dict[str, Any]) -> Any:
-    history = historical_conversion(database.analytics_rows(), score.role_family,
+                           profile: dict[str, Any], preferences: dict[str, Any], *,
+                           analytics_rows: list[dict[str, Any]] | None = None,
+                           company_rows: list[dict[str, Any]] | None = None,
+                           application_effort: int | None = None,
+                           observation_counts: tuple[int, int, int] | None = None) -> Any:
+    history = historical_conversion(analytics_rows if analytics_rows is not None else database.analytics_rows(), score.role_family,
                                     minimum_sample=int(preferences.get("analytics", {}).get("minimum_sample", 5)))
-    company_health = saturation(database.company_applications(job.company), preferences.get("company_saturation", {}))
+    company_health = saturation(company_rows if company_rows is not None else database.company_applications(job.company), preferences.get("company_saturation", {}))
     saturation_value = {"low": 85.0, "moderate": 55.0, "high": 25.0}[company_health["level"]]
-    with database.connect() as connection:
-        application = connection.execute("SELECT estimated_effort_minutes FROM application_status WHERE job_id=?", (job_id,)).fetchone()
-        observations = connection.execute("SELECT count(*),sum(reopened),sum(description_changed) FROM job_observations WHERE job_id=?", (job_id,)).fetchone()
-    effort = application[0] if application else None
+    if observation_counts is None:
+        with database.connect() as connection:
+            application = connection.execute("SELECT estimated_effort_minutes FROM application_status WHERE job_id=?", (job_id,)).fetchone()
+            observations = connection.execute("SELECT count(*),sum(reopened),sum(description_changed) FROM job_observations WHERE job_id=?", (job_id,)).fetchone()
+        effort = application[0] if application else None
+    else:
+        effort = application_effort
+        observations = observation_counts
     effort_value = None if effort is None else 90.0 if effort <= 15 else 70.0 if effort <= 30 else 45.0 if effort <= 60 else 20.0
     health_value = 50.0
     if observations and observations[0]:
@@ -64,8 +72,6 @@ def contextualize_priority(database: Database, job_id: int, job: Any, score: Any
         company_saturation=saturation_value, application_effort=effort_value,
         config=preferences.get("priority", {}),
     )
-    if not profile.get("target_role_weights") and score.eligibility_status not in {"ineligible", "manual_review"}:
-        return score
     return score.model_copy(update={"priority_score": priority, "priority_factors": factors})
 
 
@@ -89,7 +95,8 @@ def build_parser() -> argparse.ArgumentParser:
     scan_command.add_argument("--detail-retries", type=int, choices=range(0, 3), default=2)
     scan_command.add_argument("--detail-retry-interval", type=float, default=3600.0)
     scan_command.add_argument("--detail-board-timeout", type=float, default=120.0)
-    commands.add_parser("rescore", help="Re-evaluate every stored job using current configuration")
+    commands.add_parser("rescore", help="Re-evaluate every stored job, including its overall score")
+    commands.add_parser("reanalyze", help="Refresh derived v2 intelligence without rescanning or changing overall scores")
     listing = commands.add_parser("list", help="List saved jobs by priority")
     listing.add_argument("--minimum-score", type=float, default=0)
     state = listing.add_mutually_exclusive_group()
@@ -254,6 +261,54 @@ def scan(database: Database, config_dir: Path, *, force_detail_refresh: bool = F
     for label, value in summary.items():
         print(f"  {label}: {value}")
     return 0 if errors == 0 else 1
+
+
+def reanalyze(database: Database, config_dir: Path) -> int:
+    """Refresh deterministic derived intelligence without external I/O.
+
+    The legacy overall score is deliberately retained. Application priority is
+    recalculated from that stable score plus current contextual factors.
+    """
+    profile, preferences, _ = load_configuration(config_dir)
+    stored = database.all_jobs()
+    with database.connect() as connection:
+        previous_overall = dict(connection.execute("SELECT job_id,overall_score FROM job_scores"))
+    first_pass = []
+    for job_id, job in stored:
+        scored = score_job(job, profile, preferences)
+        if job_id in previous_overall:
+            scored = scored.model_copy(update={"overall_score": previous_overall[job_id]})
+        first_pass.append((job_id, job, scored))
+    # Persist classifications before computing historical conversion, so every
+    # contextual score sees one coherent analysis version.
+    with database.connect() as connection:
+        for job_id, _, scored in first_pass:
+            database.save_score(job_id, scored, connection=connection)
+    analytics_rows = database.analytics_rows()
+    companies: dict[str, list[dict[str, Any]]] = {}
+    for row in analytics_rows:
+        companies.setdefault(str(row["company"]).lower(), []).append(row)
+    with database.connect() as connection:
+        context = {
+            int(row["job_id"]): (row["estimated_effort_minutes"],
+                (int(row["times_seen"] or 0), int(row["reopened"] or 0), int(row["changed"] or 0)))
+            for row in connection.execute(
+                """SELECT a.job_id,a.estimated_effort_minutes,count(o.id) times_seen,
+                          COALESCE(sum(o.reopened),0) reopened,COALESCE(sum(o.description_changed),0) changed
+                   FROM application_status a LEFT JOIN job_observations o ON o.job_id=a.job_id
+                   GROUP BY a.job_id"""
+            )
+        }
+    with database.connect() as connection:
+        for job_id, job, scored in first_pass:
+            effort, observations = context.get(job_id, (None, (0, 0, 0)))
+            scored = contextualize_priority(
+                database, job_id, job, scored, profile, preferences,
+                analytics_rows=analytics_rows, company_rows=companies.get(job.company.lower(), []),
+                application_effort=effort, observation_counts=observations,
+            )
+            database.save_score(job_id, scored, connection=connection)
+    return len(stored)
 
 
 def list_jobs(database: Database, args: argparse.Namespace) -> None:
@@ -537,6 +592,10 @@ def main(argv: list[str] | None = None) -> int:
             scored = contextualize_priority(database, job_id, job, score_job(job, profile, preferences), profile, preferences)
             database.save_score(job_id, scored)
         print(f"Rescored {len(stored)} stored jobs.")
+    elif args.command == "reanalyze":
+        database.initialize()
+        count = reanalyze(database, args.config_dir)
+        print(f"Reanalyzed {count} stored jobs at analysis version {ANALYSIS_VERSION}; overall scores and application history were preserved.")
     elif args.command == "list":
         database.initialize()
         list_jobs(database, args)

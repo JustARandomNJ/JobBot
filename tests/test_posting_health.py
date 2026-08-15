@@ -40,7 +40,15 @@ def test_repost_risk_levels():
 def test_existing_database_is_backed_up_before_migration(tmp_path):
     path = tmp_path / "jobs.db"
     db = Database(path); db.initialize()
+    job = Job(source="legacy", external_id="1", title="Firmware Engineer", description="C RTOS")
+    job_id, _ = db.upsert_job(job)
     with db.connect() as c:
         c.execute("DROP TABLE job_observations")
     Database(path).initialize()
     assert list((tmp_path / "backups").glob("jobs-*.db.bak"))
+    with Database(path).connect() as connection:
+        observation = connection.execute(
+            "SELECT observed_at,description_changed,reopened FROM job_observations WHERE job_id=?", (job_id,)
+        ).fetchone()
+    assert observation["observed_at"] == job.date_discovered.isoformat()
+    assert observation["description_changed"] == 0 and observation["reopened"] == 0

@@ -12,6 +12,8 @@ from ranking.role_classifier import classify_role
 from ranking.posting_health import freshness_score
 from ranking.priority import calculate_priority
 
+ANALYSIS_VERSION = 2
+
 
 def _clamp(value: float) -> float:
     return round(max(0.0, min(100.0, value)), 1)
@@ -154,16 +156,12 @@ def score_job(job: Job, profile: dict[str, Any], preferences: dict[str, Any], no
         explanation += " " + " ".join(f"{reason}." for reason in negative_reasons)
     role = classify_role(job)
     role_weights = profile.get("target_role_weights", {})
-    # Profiles without v2 role preferences retain the historical aggregate
-    # during migration. Once configured, priority gets its distinct meaning.
     application_priority, priority_factors = calculate_priority(
         overall_score=priority, eligibility=eligibility.eligibility_status,
         role_weight=role_weights.get(role.role_family) if role_weights else None,
         freshness=freshness_score(job.date_posted, preferences.get("posting_health", {}), now)[0],
         config=preferences.get("priority", {}),
     )
-    if not role_weights and eligibility.eligibility_status not in {"ineligible", "manual_review"}:
-        application_priority = priority
     return JobScore(
         fit_score=fit, competitiveness_score=competitiveness, preference_score=preference_score,
         recency_score=recency, priority_score=application_priority, detected_category=category,
@@ -187,4 +185,5 @@ def score_job(job: Job, profile: dict[str, Any], preferences: dict[str, Any], no
         eligibility_reasons=eligibility.structured_reasons, role_family=role.role_family,
         role_subfamily=role.role_subfamily, role_evidence=list(role.evidence),
         priority_factors=priority_factors,
+        analysis_version=ANALYSIS_VERSION,
     )

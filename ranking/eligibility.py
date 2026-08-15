@@ -228,6 +228,10 @@ def evaluate_eligibility(job: Job, preferences: dict[str, Any], profile: dict[st
     # Consolidate existing authorization/defense logic with conservative general
     # hard-requirement parsing. Ambiguous language always routes to review.
     hard: list[tuple[str, str, str]] = []
+    if "Title indicates a senior or leadership role" in result.reasons:
+        hard.append(("ineligible", "seniority", "Title indicates a senior or leadership role."))
+    if "Title is in an avoided job category" in result.reasons:
+        hard.append(("ineligible", "unrelated_role", "Title is in a configured avoided job category."))
     combined = re.sub(r"\s+", " ", f"{job.title}. {job.description}")
     candidate_profile = profile or {}
     if years is not None and years >= float(config.get("reject_experience_years", 5)) and not config.get("allow_experience_override", False):
@@ -247,10 +251,14 @@ def evaluate_eligibility(job: Job, preferences: dict[str, Any], profile: dict[st
     for code, pattern, reason in checks:
         match = re.search(pattern, combined, re.I)
         if match:
-            if code == "student_only" and current_student is False:
-                hard.append(("ineligible", code, reason))
-            elif code == "graduation_window" and graduation:
-                hard.append(("manual_review", code, reason + f" Candidate graduation is {graduation}."))
+            if code == "student_only":
+                if current_student is False:
+                    hard.append(("ineligible", code, reason))
+                elif current_student is not True:
+                    hard.append(("manual_review", code, reason + " Current enrollment is not established by the profile."))
+            elif code == "graduation_window":
+                detail = f" Candidate graduation is {graduation}." if graduation else " Candidate graduation date is not configured."
+                hard.append(("manual_review", code, reason + detail))
             elif code not in {"student_only", "graduation_window"}:
                 hard.append(("manual_review", code, reason))
     degree_match = re.search(r"(?:bachelor'?s|master'?s|ph\.?d\.?|[A-Z]\.?S\.?) degree (?:is )?(?:required|minimum)", combined, re.I)

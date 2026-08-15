@@ -11,7 +11,7 @@ from models.job import Job
 ROLE_RULES: dict[str, tuple[tuple[str, int], ...]] = {
     "bsp_drivers": ((r"\bdevice drivers?\b", 8), (r"\bBSP\b|board support package", 9), (r"kernel module", 7), (r"bootloader", 3)),
     "embedded_linux": ((r"embedded linux", 9), (r"\bYocto\b|Buildroot", 6), (r"Linux kernel", 5), (r"device tree", 5)),
-    "embedded_firmware": ((r"embedded firmware", 10), (r"\bMCU\b|microcontroller", 6), (r"\bRTOS\b|real[- ]time operating", 5), (r"bare metal", 5), (r"\bSPI\b|\bI2C\b|\bUART\b|\bCAN bus\b", 2)),
+    "embedded_firmware": ((r"embedded (?:software|firmware)", 8), (r"\bfirmware\b", 6), (r"\bMCU\b|microcontroller", 6), (r"\bRTOS\b|real[- ]time operating", 5), (r"bare metal", 5), (r"\bSPI\b|\bI2C\b|\bUART\b|\bCAN bus\b", 2)),
     "firmware": ((r"\bfirmware\b", 7), (r"low[- ]level software", 3)),
     "kernel": ((r"\bkernel engineer", 9), (r"kernel development", 7), (r"kernel internals", 6)),
     "controls_motor_control": ((r"motor control", 10), (r"control systems?", 7), (r"PID control", 6), (r"field oriented control|\bFOC\b", 7)),
@@ -60,6 +60,13 @@ def classify_role(job: Job) -> RoleClassification:
                 total -= 8
         scores[family] = max(0, total)
         evidence[family] = hits
+    # An embedded-software title is refined by concrete platform work in the
+    # description. These are cross-field signals, not company/title special cases.
+    if re.search(r"embedded software", title, re.I):
+        if re.search(r"\b(?:device drivers?|BSP|board support package|kernel modules?)\b", body, re.I):
+            scores["bsp_drivers"] += 10
+        elif re.search(r"\bLinux\b|\bJetson\b|\bYocto\b|\bBuildroot\b", body, re.I):
+            scores["embedded_linux"] += 10
     family = max(scores, key=scores.get)
     ordered = sorted(scores.values(), reverse=True)
     # A weak isolated body keyword is not enough to classify the entire role.

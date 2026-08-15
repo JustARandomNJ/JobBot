@@ -23,6 +23,12 @@ def test_role_preference_and_freshness_influence_priority():
     assert fresh.overall_score == round(expected_overall, 1)
 
 
+def test_equal_technical_fit_gets_distinct_contextual_priority():
+    preferred, _ = calculate_priority(overall_score=80, eligibility="eligible", role_weight=1.0, freshness=100)
+    stale_backup, _ = calculate_priority(overall_score=80, eligibility="eligible", role_weight=.4, freshness=20)
+    assert preferred != stale_backup
+
+
 def test_unknown_components_are_neutral_and_inspectable():
     score, factors = calculate_priority(overall_score=70, eligibility="unknown")
     assert 0 < score < 100

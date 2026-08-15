@@ -220,6 +220,27 @@ class Database:
                 """INSERT OR IGNORE INTO relevance_reviews (job_id, relevance, note, updated_at)
                    SELECT id, 'unreviewed', '', ? FROM jobs""", (now,)
             )
+            self._backfill_baseline_observations(connection)
+
+    @staticmethod
+    def _backfill_baseline_observations(connection: sqlite3.Connection) -> None:
+        """Record one honest migration baseline for jobs predating observations."""
+        rows = connection.execute(
+            """SELECT j.id,j.date_discovered,j.description,j.apply_url,j.external_id,j.source_metadata,j.is_active
+               FROM jobs j WHERE NOT EXISTS
+               (SELECT 1 FROM job_observations o WHERE o.job_id=j.id)"""
+        ).fetchall()
+        for row in rows:
+            fingerprint = hashlib.sha256(" ".join(row["description"].lower().split()).encode("utf-8")).hexdigest()
+            metadata = json.loads(row["source_metadata"] or "{}")
+            requisition = metadata.get("requisition_id") or metadata.get("requisitionId") or row["external_id"] or None
+            connection.execute(
+                """INSERT INTO job_observations
+                   (job_id,observed_at,scan_id,is_active,description_fingerprint,canonical_url,requisition_id,
+                    description_changed,reopened) VALUES (?,?,?,?,?,?,?,?,?)""",
+                (row["id"], row["date_discovered"], None, row["is_active"], fingerprint,
+                 normalize_url(row["apply_url"]), requisition, 0, 0),
+            )
 
     def _backup_before_intelligence_migration(self) -> None:
         """Create one timestamped copy before the first v2 schema change."""
@@ -266,6 +287,7 @@ class Database:
                 "eligibility_reasons": "TEXT NOT NULL DEFAULT '[]'", "role_family": "TEXT NOT NULL DEFAULT 'other'",
                 "role_subfamily": "TEXT", "role_evidence": "TEXT NOT NULL DEFAULT '[]'",
                 "priority_factors": "TEXT NOT NULL DEFAULT '[]'",
+                "analysis_version": "INTEGER NOT NULL DEFAULT 0",
             },
             "scan_history": {
                 "companies_succeeded": "INTEGER NOT NULL DEFAULT 0",
@@ -387,6 +409,7 @@ class Database:
             datetime.now(timezone.utc).isoformat(), score.overall_score, score.eligibility_status,
             json.dumps(score.eligibility_reasons), score.role_family, score.role_subfamily,
             json.dumps(score.role_evidence), json.dumps(score.priority_factors),
+            score.analysis_version,
         )
         with (self.connect() if connection is None else nullcontext(connection)) as connection:
             connection.execute(
@@ -400,8 +423,8 @@ class Database:
                     active_clearance_required, clearance_eligibility_required, work_authorization_eligibility,
                     defense_eligibility_status, defense_eligibility_reasons, eligibility_evidence_snippets, scored_at,
                     overall_score, eligibility_status, eligibility_reasons, role_family, role_subfamily, role_evidence,
-                    priority_factors
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    priority_factors, analysis_version
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(job_id) DO UPDATE SET
                   fit_score=excluded.fit_score, competitiveness_score=excluded.competitiveness_score,
                   preference_score=excluded.preference_score, recency_score=excluded.recency_score,
@@ -428,6 +451,7 @@ class Database:
                   eligibility_reasons=excluded.eligibility_reasons, role_family=excluded.role_family,
                   role_subfamily=excluded.role_subfamily, role_evidence=excluded.role_evidence,
                   priority_factors=excluded.priority_factors,
+                  analysis_version=excluded.analysis_version,
                   scored_at=excluded.scored_at""",
                 values,
             )

@@ -16,6 +16,17 @@ def test_extract_requirements():
     assert extract_requirements("Firmware", "C and an RTOS with CAN bus") == ["C", "CAN", "RTOS"]
 
 
+def test_single_character_c_evidence_is_token_aware():
+    assert extract_requirements("Engineer", "C") == ["C"]
+    assert "C" in extract_requirements("Engineer", "embedded C firmware")
+    assert "C" not in extract_requirements("Engineer", "I2C CAN CUDA device microcontroller")
+    mapped = {item["requirement"]: item for item in map_evidence(
+        ["I2C", "device drivers"], {"expert_skills": ["C"]}
+    )}
+    assert mapped["I2C"]["state"] == "no_profile_evidence"
+    assert mapped["device drivers"]["state"] == "no_profile_evidence"
+
+
 def test_company_saturation_coherent_and_unrelated():
     coherent = [{"status": "applied", "role_family": "firmware"}] * 3
     assert saturation(coherent)["level"] == "moderate"
