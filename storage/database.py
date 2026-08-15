@@ -19,11 +19,16 @@ VALID_STATUSES = {
 VALID_REVIEWS = {"unreviewed", "strong match", "possible", "poor match", "irrelevant"}
 VALID_CONTACT_TYPES = {"recruiter", "hiring manager", "team member", "referral", "general recruiting contact", "unknown"}
 VALID_FOLLOW_UP_METHODS = {"email", "linkedin", "phone", "referral", "other"}
+VALID_SKIP_REASONS = {"ineligible", "student_only", "graduation_window", "experience_requirement",
+    "citizenship", "clearance", "export_control", "sponsorship", "location", "salary", "duplicate",
+    "stale", "application_closed", "application_unavailable", "already_applied_elsewhere",
+    "not_interested", "other"}
 JSON_FIELDS = {
     "required_skills", "preferred_skills", "source_metadata", "matching_skills",
     "matching_required_skills", "matching_preferred_skills", "missing_required_skills",
     "missing_preferred_skills", "eligibility_flags", "positive_reasons", "negative_reasons",
     "defense_eligibility_reasons", "eligibility_evidence_snippets",
+    "eligibility_reasons", "role_evidence",
 }
 
 
@@ -216,6 +221,9 @@ class Database:
                 "defense_eligibility_status": "TEXT NOT NULL DEFAULT 'no_special_requirement'",
                 "defense_eligibility_reasons": "TEXT NOT NULL DEFAULT '[]'",
                 "eligibility_evidence_snippets": "TEXT NOT NULL DEFAULT '[]'",
+                "overall_score": "REAL", "eligibility_status": "TEXT NOT NULL DEFAULT 'unknown'",
+                "eligibility_reasons": "TEXT NOT NULL DEFAULT '[]'", "role_family": "TEXT NOT NULL DEFAULT 'other'",
+                "role_subfamily": "TEXT", "role_evidence": "TEXT NOT NULL DEFAULT '[]'",
             },
             "scan_history": {
                 "companies_succeeded": "INTEGER NOT NULL DEFAULT 0",
@@ -232,6 +240,7 @@ class Database:
                 "follow_up_count": "INTEGER NOT NULL DEFAULT 0", "next_follow_up_at": "TEXT",
                 "do_not_follow_up": "INTEGER NOT NULL DEFAULT 0",
                 "application_date_unknown": "INTEGER NOT NULL DEFAULT 0",
+                "skip_reason": "TEXT",
             },
         }
         for table, columns in migrations.items():
@@ -239,6 +248,7 @@ class Database:
             for name, definition in columns.items():
                 if name not in existing:
                     connection.execute(f"ALTER TABLE {table} ADD COLUMN {name} {definition}")
+        connection.execute("UPDATE job_scores SET overall_score=priority_score WHERE overall_score IS NULL")
 
     def upsert_job(self, job: Job, scan_id: int | None = None,
                    connection: sqlite3.Connection | None = None) -> tuple[int, bool]:
@@ -311,7 +321,9 @@ class Database:
             int(score.active_clearance_required), int(score.clearance_eligibility_required),
             score.work_authorization_eligibility, score.defense_eligibility_status,
             json.dumps(score.defense_eligibility_reasons), json.dumps(score.eligibility_evidence_snippets),
-            datetime.now(timezone.utc).isoformat(),
+            datetime.now(timezone.utc).isoformat(), score.overall_score, score.eligibility_status,
+            json.dumps(score.eligibility_reasons), score.role_family, score.role_subfamily,
+            json.dumps(score.role_evidence),
         )
         with (self.connect() if connection is None else nullcontext(connection)) as connection:
             connection.execute(
@@ -323,8 +335,9 @@ class Database:
                     rejected, explanation, recommendation, citizenship_requirement,
                     export_control_requirement, security_clearance_requirement, required_clearance_level,
                     active_clearance_required, clearance_eligibility_required, work_authorization_eligibility,
-                    defense_eligibility_status, defense_eligibility_reasons, eligibility_evidence_snippets, scored_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    defense_eligibility_status, defense_eligibility_reasons, eligibility_evidence_snippets, scored_at,
+                    overall_score, eligibility_status, eligibility_reasons, role_family, role_subfamily, role_evidence
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(job_id) DO UPDATE SET
                   fit_score=excluded.fit_score, competitiveness_score=excluded.competitiveness_score,
                   preference_score=excluded.preference_score, recency_score=excluded.recency_score,
@@ -347,6 +360,9 @@ class Database:
                   defense_eligibility_status=excluded.defense_eligibility_status,
                   defense_eligibility_reasons=excluded.defense_eligibility_reasons,
                   eligibility_evidence_snippets=excluded.eligibility_evidence_snippets,
+                  overall_score=excluded.overall_score, eligibility_status=excluded.eligibility_status,
+                  eligibility_reasons=excluded.eligibility_reasons, role_family=excluded.role_family,
+                  role_subfamily=excluded.role_subfamily, role_evidence=excluded.role_evidence,
                   scored_at=excluded.scored_at""",
                 values,
             )
@@ -390,19 +406,19 @@ class Database:
             clauses.append(f"a.status IN ({placeholders})")
             params.extend(sorted(statuses))
         if eligibility == "eligible":
-            clauses.append("s.defense_eligibility_status IN ('eligible', 'no_special_requirement')")
+            clauses.append("s.eligibility_status = 'eligible'")
         elif eligibility == "manual_review":
-            clauses.append("s.defense_eligibility_status = 'manual_review'")
+            clauses.append("s.eligibility_status = 'manual_review'")
         elif eligibility == "ineligible":
-            clauses.append("s.defense_eligibility_status IN ('ineligible_citizenship', 'ineligible_clearance')")
+            clauses.append("s.eligibility_status = 'ineligible'")
         elif eligibility == "not_ineligible":
-            clauses.append("s.defense_eligibility_status NOT IN ('ineligible_citizenship', 'ineligible_clearance')")
+            clauses.append("s.eligibility_status <> 'ineligible'")
         limit_sql = "" if limit is None else " LIMIT ?"
         if limit is not None:
             params.append(limit)
         with self.connect() as connection:
             rows = connection.execute(
-                f"""SELECT j.*, s.*, a.status,a.applied_at,a.last_follow_up_at,a.follow_up_count,
+                f"""SELECT j.*, s.*, a.status,a.skip_reason,a.applied_at,a.last_follow_up_at,a.follow_up_count,
                           a.next_follow_up_at,a.do_not_follow_up,r.relevance, r.note AS review_note,
                           (SELECT max(id) FROM scan_history WHERE completed_at IS NOT NULL) AS latest_scan_id
                    FROM jobs j
@@ -420,7 +436,7 @@ class Database:
     def get_job(self, job_id: int) -> dict[str, Any] | None:
         with self.connect() as connection:
             row = connection.execute(
-                """SELECT j.*, s.*, a.status,a.applied_at,a.last_follow_up_at,a.follow_up_count,
+                """SELECT j.*, s.*, a.status,a.skip_reason,a.applied_at,a.last_follow_up_at,a.follow_up_count,
                           a.next_follow_up_at,a.do_not_follow_up,r.relevance, r.note AS review_note,
                           (SELECT max(id) FROM scan_history WHERE completed_at IS NOT NULL) AS latest_scan_id
                    FROM jobs j JOIN job_scores s ON s.job_id=j.id
@@ -524,10 +540,16 @@ class Database:
             return int(connection.execute(sql, params).fetchone()[0])
 
     def update_status(self, job_id: int, status: str, applied_at: datetime | None = None,
-                      do_not_follow_up: bool | None = None) -> bool:
+                      do_not_follow_up: bool | None = None, skip_reason: str | None = None) -> bool:
         normalized = status.strip().lower().replace("_", "-").replace("-", " ")
         if normalized not in VALID_STATUSES:
             raise ValueError(f"Unknown status. Choose one of: {', '.join(sorted(VALID_STATUSES))}")
+        if skip_reason is not None:
+            skip_reason = skip_reason.strip().lower().replace("-", "_")
+            if normalized != "skipped":
+                raise ValueError("--reason is only valid when status is skipped")
+            if skip_reason not in VALID_SKIP_REASONS:
+                raise ValueError(f"Unknown skip reason. Choose one of: {', '.join(sorted(VALID_SKIP_REASONS))}")
         with self.connect() as connection:
             existing = connection.execute(
                 "SELECT status,applied_at,application_date_unknown FROM application_status WHERE job_id=?", (job_id,)
@@ -547,8 +569,9 @@ class Database:
             ).fetchone()[0]
             cursor = connection.execute(
                 """UPDATE application_status SET status=?,updated_at=?,applied_at=?,
-                   do_not_follow_up=?,application_date_unknown=? WHERE job_id=?""",
-                (normalized, datetime.now(timezone.utc).isoformat(), application_date, suppression, date_unknown, job_id),
+                   do_not_follow_up=?,application_date_unknown=?,skip_reason=? WHERE job_id=?""",
+                (normalized, datetime.now(timezone.utc).isoformat(), application_date, suppression, date_unknown,
+                 skip_reason if normalized == "skipped" else None, job_id),
             )
             return cursor.rowcount == 1
 

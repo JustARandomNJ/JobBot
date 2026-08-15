@@ -26,6 +26,8 @@ class EligibilityResult:
     defense_eligibility_status: str = "no_special_requirement"
     defense_eligibility_reasons: list[str] = field(default_factory=list)
     eligibility_evidence_snippets: list[str] = field(default_factory=list)
+    eligibility_status: str = "unknown"
+    structured_reasons: list[dict[str, str]] = field(default_factory=list)
 
 
 def _contains_phrase(text: str, phrase: str) -> bool:
@@ -223,6 +225,51 @@ def evaluate_eligibility(job: Job, preferences: dict[str, Any], profile: dict[st
         result.defense_eligibility_reasons.append("Warning: public eligibility fields could not be fully inspected")
     if result.defense_eligibility_status.startswith("ineligible_"):
         result.rejected = True
+    # Consolidate existing authorization/defense logic with conservative general
+    # hard-requirement parsing. Ambiguous language always routes to review.
+    hard: list[tuple[str, str, str]] = []
+    combined = re.sub(r"\s+", " ", f"{job.title}. {job.description}")
+    candidate_profile = profile or {}
+    current_student = candidate_profile.get("current_student")
+    graduation = str(candidate_profile.get("graduation_date", ""))
+    degree = candidate_profile.get("degree")
+    degree_text = degree if isinstance(degree, str) else str((degree or {}).get("name", ""))
+    checks = [
+        ("student_only", r"(?:must be|requires?) (?:a )?currently enrolled|current(?:ly)? (?:university |college )?student|required to return to (?:school|university)", "Position requires current university enrollment."),
+        ("graduation_window", r"graduat(?:e|ing|ion)[^.;]{0,80}(?:between|after|before)[^.;]{0,60}", "Posting specifies a graduation window."),
+        ("drivers_license", r"(?:valid|current) driver'?s license (?:is )?(?:required|must)", "Position requires a driver's license."),
+        ("relocation", r"must (?:be willing to )?relocate|relocation (?:is )?required", "Position requires relocation."),
+        ("travel", r"(?:requires?|ability to) travel (?:up to )?(\d{1,3})%", "Position has a mandatory travel requirement."),
+        ("onsite", r"(?:must|required to) (?:work|be) (?:on[- ]?site|in office)", "Position requires onsite work."),
+    ]
+    for code, pattern, reason in checks:
+        match = re.search(pattern, combined, re.I)
+        if match:
+            if code == "student_only" and current_student is False:
+                hard.append(("ineligible", code, reason))
+            elif code == "graduation_window" and graduation:
+                hard.append(("manual_review", code, reason + f" Candidate graduation is {graduation}."))
+            elif code not in {"student_only", "graduation_window"}:
+                hard.append(("manual_review", code, reason))
+    degree_match = re.search(r"(?:bachelor'?s|master'?s|ph\.?d\.?|[A-Z]\.?S\.?) degree (?:is )?(?:required|minimum)", combined, re.I)
+    if degree_match and not degree_text:
+        hard.append(("manual_review", "degree", "Posting has a mandatory degree requirement not established by the profile."))
+    if result.defense_eligibility_status.startswith("ineligible_"):
+        code = "citizenship" if "citizenship" in result.defense_eligibility_status else "clearance"
+        hard.append(("ineligible", code, "; ".join(result.defense_eligibility_reasons)))
+    elif result.defense_eligibility_status == "manual_review":
+        hard.append(("manual_review", "clearance", "; ".join(result.defense_eligibility_reasons)))
+    if result.work_authorization_eligibility == "ineligible":
+        hard.append(("ineligible", "sponsorship", "Candidate work authorization does not satisfy the posting."))
+    result.structured_reasons = [{"code": code, "message": message} for _, code, message in hard]
+    if any(level == "ineligible" for level, _, _ in hard):
+        result.eligibility_status = "ineligible"
+    elif any(level == "manual_review" for level, _, _ in hard):
+        result.eligibility_status = "manual_review"
+    elif job.description.strip():
+        result.eligibility_status = "eligible"
+    else:
+        result.eligibility_status = "unknown"
     result.reasons.extend(result.defense_eligibility_reasons)
     result.flags.extend(result.eligibility_evidence_snippets)
     return result

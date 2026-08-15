@@ -75,6 +75,7 @@ def build_parser() -> argparse.ArgumentParser:
     status.add_argument("job_id", type=int)
     status.add_argument("status", help=f"One of: {', '.join(sorted(VALID_STATUSES))}")
     status.add_argument("--date", type=date.fromisoformat, help="Original application date (YYYY-MM-DD)")
+    status.add_argument("--reason", help="Structured reason when status is skipped")
     suppression = status.add_mutually_exclusive_group()
     suppression.add_argument("--do-not-follow-up", action="store_true")
     suppression.add_argument("--allow-follow-up", action="store_true")
@@ -313,7 +314,12 @@ def show_job(job: dict[str, Any]) -> None:
     if job["review_note"]:
         print(f"Review note: {job['review_note']}")
     print(f"Discovered: {job['date_discovered']} | Last seen: {job['last_seen_at'] or 'Unknown'} | Posted: {job['date_posted'] or 'Unknown'}")
-    print(f"Priority: {job['priority_score']:.1f} (fit {job['fit_score']:.1f}, competitiveness {job['competitiveness_score']:.1f}, preference {job['preference_score']:.1f}, recency {job['recency_score']:.1f})")
+    print(f"Technical fit score: {job.get('overall_score', job['priority_score']):.1f}")
+    print(f"Application priority: {job['priority_score']:.1f}")
+    print(f"Role family: {job.get('role_family', 'other')}" + (f" / {job['role_subfamily']}" if job.get('role_subfamily') else ""))
+    print(f"Eligibility: {job.get('eligibility_status', 'unknown').upper()}")
+    for reason in job.get("eligibility_reasons", []):
+        print(f"  - {reason['message']}")
     print(f"Recommendation: {job['recommendation']} | Category: {job['detected_category'] or 'Uncategorized'} | Seniority: {job['detected_seniority'] or 'Unspecified'} | Required experience: {job['required_experience_years'] if job['required_experience_years'] is not None else 'Unknown'}")
     print(f"Matching required skills: {joined('matching_required_skills')}")
     print(f"Matching preferred skills: {joined('matching_preferred_skills')}")
@@ -430,7 +436,7 @@ def main(argv: list[str] | None = None) -> int:
         try:
             applied_at = datetime.combine(args.date, datetime_time.min, tzinfo=timezone.utc) if args.date else None
             suppress = True if args.do_not_follow_up else False if args.allow_follow_up else None
-            if not database.update_status(args.job_id, args.status, applied_at, suppress):
+            if not database.update_status(args.job_id, args.status, applied_at, suppress, args.reason):
                 print(f"Job {args.job_id} was not found.", file=sys.stderr)
                 return 1
         except ValueError as exc:

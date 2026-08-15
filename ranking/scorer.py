@@ -8,6 +8,7 @@ from typing import Any
 from models.job import Job, JobScore
 from ranking.eligibility import evaluate_eligibility
 from ranking.skill_match import SkillMatch, match_skills
+from ranking.role_classifier import classify_role
 
 
 def _clamp(value: float) -> float:
@@ -138,6 +139,7 @@ def score_job(job: Job, profile: dict[str, Any], preferences: dict[str, Any], no
     explanation = f"Recommended: {recommendation}. " + " ".join(f"{reason}." for reason in positive_reasons)
     if negative_reasons:
         explanation += " " + " ".join(f"{reason}." for reason in negative_reasons)
+    role = classify_role(job)
     return JobScore(
         fit_score=fit, competitiveness_score=competitiveness, preference_score=preference_score,
         recency_score=recency, priority_score=priority, detected_category=category,
@@ -157,4 +159,7 @@ def score_job(job: Job, profile: dict[str, Any], preferences: dict[str, Any], no
         defense_eligibility_reasons=eligibility.defense_eligibility_reasons,
         eligibility_evidence_snippets=eligibility.eligibility_evidence_snippets,
         rejected=eligibility.rejected, explanation=explanation, recommendation=recommendation,
+        overall_score=priority, eligibility_status=eligibility.eligibility_status,
+        eligibility_reasons=eligibility.structured_reasons, role_family=role.role_family,
+        role_subfamily=role.role_subfamily, role_evidence=list(role.evidence),
     )

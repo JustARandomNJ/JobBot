@@ -16,12 +16,27 @@ projects_and_technologies:
   - "SQLite databases"
   - "REST APIs"
   - "Automated testing with pytest"
-
-work_authorization: "Authorized to work in the United States"
-
-projects_and_technologies:
   - name: "Example Project"
     technologies:
       - "Python"
       - "SQLite"
     description: "A generic example project."
+
+work_authorization:
+  authorized_in_us: true
+  requires_sponsorship: false
+  us_citizen: false
+  itar_us_person: false
+  active_security_clearance: none
+  assume_standard_clearance_eligible: false
+
+target_role_weights:
+  embedded_firmware: 1.0
+  firmware: 1.0
+  embedded_linux: 0.95
+  bsp_drivers: 0.95
+  asic_design_verification: 0.90
+  asic_rtl: 0.90
+  fpga: 0.85
+  hardware_test_validation: 0.75
+  general_software: 0.60
