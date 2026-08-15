@@ -15,7 +15,14 @@ import requests
 
 from collectors import AshbyCollector, GreenhouseCollector, LeverCollector
 from config_loader import load_configuration
-from ranking.scorer import score_job
+from ranking.scorer import ANALYSIS_VERSION, score_job
+from ranking.posting_health import freshness_score, repost_risk
+from ranking.evidence import extract_requirements, map_evidence
+from ranking.company import saturation
+from ranking.analytics import summarize, historical_conversion
+from ranking.prep import prep_topics
+from ranking.priority import calculate_priority
+from config_loader import load_yaml
 from ranking.follow_up import add_business_days, rank_follow_ups
 from reports.html_report import generate_report
 from storage.database import (Database, VALID_CONTACT_TYPES, VALID_FOLLOW_UP_METHODS,
@@ -28,6 +35,44 @@ DEFAULT_REPORT = ROOT / "data" / "report.html"
 DEFAULT_CALIBRATION = ROOT / "data" / "calibration.csv"
 COLLECTORS = {"greenhouse": GreenhouseCollector, "lever": LeverCollector, "ashby": AshbyCollector}
 ACTIONABLE_APPLICATION_STATUSES = {"not reviewed", "saved"}
+
+
+def contextualize_priority(database: Database, job_id: int, job: Any, score: Any,
+                           profile: dict[str, Any], preferences: dict[str, Any], *,
+                           analytics_rows: list[dict[str, Any]] | None = None,
+                           company_rows: list[dict[str, Any]] | None = None,
+                           application_effort: int | None = None,
+                           observation_counts: tuple[int, int, int] | None = None) -> Any:
+    history = historical_conversion(analytics_rows if analytics_rows is not None else database.analytics_rows(), score.role_family,
+                                    minimum_sample=int(preferences.get("analytics", {}).get("minimum_sample", 5)))
+    company_health = saturation(company_rows if company_rows is not None else database.company_applications(job.company), preferences.get("company_saturation", {}))
+    saturation_value = {"low": 85.0, "moderate": 55.0, "high": 25.0}[company_health["level"]]
+    if observation_counts is None:
+        with database.connect() as connection:
+            application = connection.execute("SELECT estimated_effort_minutes FROM application_status WHERE job_id=?", (job_id,)).fetchone()
+            observations = connection.execute("SELECT count(*),sum(reopened),sum(description_changed) FROM job_observations WHERE job_id=?", (job_id,)).fetchone()
+        effort = application[0] if application else None
+    else:
+        effort = application_effort
+        observations = observation_counts
+    effort_value = None if effort is None else 90.0 if effort <= 15 else 70.0 if effort <= 30 else 45.0 if effort <= 60 else 20.0
+    health_value = 50.0
+    if observations and observations[0]:
+        discovered = job.date_discovered if job.date_discovered.tzinfo else job.date_discovered.replace(tzinfo=timezone.utc)
+        observed_age = max(0.0, (datetime.now(timezone.utc) - discovered).total_seconds() / 86400)
+        risk, _ = repost_risk(age_days=observed_age, reopened_count=observations[1] or 0,
+                              times_seen=observations[0], description_changes=observations[2] or 0,
+                              thresholds=preferences.get("posting_health", {}))
+        health_value = {"low": 85.0, "moderate": 55.0, "high": 20.0}[risk]
+    priority, factors = calculate_priority(
+        overall_score=score.overall_score, eligibility=score.eligibility_status,
+        role_weight=profile.get("target_role_weights", {}).get(score.role_family),
+        freshness=freshness_score(job.date_posted, preferences.get("posting_health", {}))[0],
+        historical_conversion=history, posting_health=health_value,
+        company_saturation=saturation_value, application_effort=effort_value,
+        config=preferences.get("priority", {}),
+    )
+    return score.model_copy(update={"priority_score": priority, "priority_factors": factors})
 
 
 def positive_int(value: str) -> int:
@@ -50,7 +95,8 @@ def build_parser() -> argparse.ArgumentParser:
     scan_command.add_argument("--detail-retries", type=int, choices=range(0, 3), default=2)
     scan_command.add_argument("--detail-retry-interval", type=float, default=3600.0)
     scan_command.add_argument("--detail-board-timeout", type=float, default=120.0)
-    commands.add_parser("rescore", help="Re-evaluate every stored job using current configuration")
+    commands.add_parser("rescore", help="Re-evaluate every stored job, including its overall score")
+    commands.add_parser("reanalyze", help="Refresh derived v2 intelligence without rescanning or changing overall scores")
     listing = commands.add_parser("list", help="List saved jobs by priority")
     listing.add_argument("--minimum-score", type=float, default=0)
     state = listing.add_mutually_exclusive_group()
@@ -69,12 +115,22 @@ def build_parser() -> argparse.ArgumentParser:
     top.add_argument("--limit", type=positive_int, default=5)
     show = commands.add_parser("show", help="Show a complete scoring breakdown")
     show.add_argument("job_id", type=int)
+    package = commands.add_parser("package", help="Build a deterministic application package")
+    package.add_argument("job_id", type=int)
+    effort = commands.add_parser("set-effort", help="Set estimated application minutes")
+    effort.add_argument("job_id", type=int); effort.add_argument("minutes", type=positive_int)
+    commands.add_parser("analytics", help="Show application funnel analytics")
+    prep = commands.add_parser("prep", help="Generate deterministic interview preparation")
+    prep.add_argument("job_id", type=int)
+    answers = commands.add_parser("answers", help="List local application-answer keys")
+    answers.add_argument("--get", dest="answer_key", help="Print one answer value")
     report = commands.add_parser("report", help="Write a local static HTML report")
     report.add_argument("--output", type=Path, default=DEFAULT_REPORT)
     status = commands.add_parser("update-status", help="Update application workflow status")
     status.add_argument("job_id", type=int)
     status.add_argument("status", help=f"One of: {', '.join(sorted(VALID_STATUSES))}")
     status.add_argument("--date", type=date.fromisoformat, help="Original application date (YYYY-MM-DD)")
+    status.add_argument("--reason", help="Structured reason when status is skipped")
     suppression = status.add_mutually_exclusive_group()
     suppression.add_argument("--do-not-follow-up", action="store_true")
     suppression.add_argument("--allow-follow-up", action="store_true")
@@ -151,16 +207,21 @@ def scan(database: Database, config_dir: Path, *, force_detail_refresh: bool = F
             fetched += len(jobs)
             seen_job_ids: set[int] = set()
             company_saved = company_updated = 0
+            contextual_jobs: list[tuple[int, Any, Any]] = []
             with database.connect() as connection:
                 for job in jobs:
                     job_id, created = database.upsert_job(job, scan_id=scan_id, connection=connection)
                     seen_job_ids.add(job_id)
-                    database.save_score(job_id, score_job(job, profile, preferences), connection=connection)
+                    scored = score_job(job, profile, preferences)
+                    database.save_score(job_id, scored, connection=connection)
+                    contextual_jobs.append((job_id, job, scored))
                     company_saved += int(created)
                     company_updated += int(not created)
                 company_inactive = database.reconcile_company_scan(
                     company_name, source, seen_job_ids, connection=connection
                 )
+            for job_id, job, scored in contextual_jobs:
+                database.save_score(job_id, contextualize_priority(database, job_id, job, scored, profile, preferences))
             saved += company_saved
             updated += company_updated
             newly_inactive += company_inactive
@@ -200,6 +261,54 @@ def scan(database: Database, config_dir: Path, *, force_detail_refresh: bool = F
     for label, value in summary.items():
         print(f"  {label}: {value}")
     return 0 if errors == 0 else 1
+
+
+def reanalyze(database: Database, config_dir: Path) -> int:
+    """Refresh deterministic derived intelligence without external I/O.
+
+    The legacy overall score is deliberately retained. Application priority is
+    recalculated from that stable score plus current contextual factors.
+    """
+    profile, preferences, _ = load_configuration(config_dir)
+    stored = database.all_jobs()
+    with database.connect() as connection:
+        previous_overall = dict(connection.execute("SELECT job_id,overall_score FROM job_scores"))
+    first_pass = []
+    for job_id, job in stored:
+        scored = score_job(job, profile, preferences)
+        if job_id in previous_overall:
+            scored = scored.model_copy(update={"overall_score": previous_overall[job_id]})
+        first_pass.append((job_id, job, scored))
+    # Persist classifications before computing historical conversion, so every
+    # contextual score sees one coherent analysis version.
+    with database.connect() as connection:
+        for job_id, _, scored in first_pass:
+            database.save_score(job_id, scored, connection=connection)
+    analytics_rows = database.analytics_rows()
+    companies: dict[str, list[dict[str, Any]]] = {}
+    for row in analytics_rows:
+        companies.setdefault(str(row["company"]).lower(), []).append(row)
+    with database.connect() as connection:
+        context = {
+            int(row["job_id"]): (row["estimated_effort_minutes"],
+                (int(row["times_seen"] or 0), int(row["reopened"] or 0), int(row["changed"] or 0)))
+            for row in connection.execute(
+                """SELECT a.job_id,a.estimated_effort_minutes,count(o.id) times_seen,
+                          COALESCE(sum(o.reopened),0) reopened,COALESCE(sum(o.description_changed),0) changed
+                   FROM application_status a LEFT JOIN job_observations o ON o.job_id=a.job_id
+                   GROUP BY a.job_id"""
+            )
+        }
+    with database.connect() as connection:
+        for job_id, job, scored in first_pass:
+            effort, observations = context.get(job_id, (None, (0, 0, 0)))
+            scored = contextualize_priority(
+                database, job_id, job, scored, profile, preferences,
+                analytics_rows=analytics_rows, company_rows=companies.get(job.company.lower(), []),
+                application_effort=effort, observation_counts=observations,
+            )
+            database.save_score(job_id, scored, connection=connection)
+    return len(stored)
 
 
 def list_jobs(database: Database, args: argparse.Namespace) -> None:
@@ -309,11 +418,39 @@ def show_job(job: dict[str, Any]) -> None:
     print(f"Job {job['id']}: {job['company']} - {job['title']}")
     print(f"Location: {job['location']} | Active: {'yes' if job['is_active'] else 'no'} | New: {'yes' if job['is_new'] else 'no'}")
     print(f"Application status: {job['status']} | Relevance review: {job['relevance']}")
+    if job["status"] in {"recruiter screen", "technical interview", "final interview"}:
+        print(f"Interview stage detected. Run: python app.py prep {job['id']}")
     print(f"Applied: {(job.get('applied_at') or 'Unknown')[:10]} | Follow-ups: {job.get('follow_up_count', 0)} | Last follow-up: {(job.get('last_follow_up_at') or 'Never')[:10]}")
     if job["review_note"]:
         print(f"Review note: {job['review_note']}")
     print(f"Discovered: {job['date_discovered']} | Last seen: {job['last_seen_at'] or 'Unknown'} | Posted: {job['date_posted'] or 'Unknown'}")
-    print(f"Priority: {job['priority_score']:.1f} (fit {job['fit_score']:.1f}, competitiveness {job['competitiveness_score']:.1f}, preference {job['preference_score']:.1f}, recency {job['recency_score']:.1f})")
+    freshness, freshness_band = freshness_score(job.get("date_posted"))
+    discovered = datetime.fromisoformat(job["date_discovered"])
+    discovered = discovered if discovered.tzinfo else discovered.replace(tzinfo=timezone.utc)
+    age_days = max(0.0, (datetime.now(timezone.utc) - discovered).total_seconds() / 86400)
+    risk, risk_reasons = repost_risk(age_days=age_days, reopened_count=job.get("reopened_count", 0),
+                                     times_seen=job.get("times_seen", 1),
+                                     description_changes=job.get("description_changes", 0))
+    print("Posting health")
+    print(f"  Times observed: {job.get('times_seen', 1)} | Description changes: {job.get('description_changes', 0)}")
+    print(f"  Freshness: {freshness:.1f} ({freshness_band}) | Repost risk: {risk.upper()}")
+    for reason in risk_reasons:
+        print(f"  - {reason}")
+    if job.get("reopened_at"):
+        print("REOPENED POSITION")
+        print(f"  Previous application: {(job.get('applied_at') or 'Unknown')[:10]}")
+        print(f"  Previous result: {job.get('previous_result') or 'Unknown'}")
+        print(f"  Reopened: {job['reopened_at'][:10]}")
+    print(f"Technical fit score: {job.get('overall_score', job['priority_score']):.1f}")
+    print(f"Application priority: {job['priority_score']:.1f}")
+    print("Priority factors")
+    for factor in job.get("priority_factors", []):
+        value = "unknown" if factor.get("value") is None else factor.get("value")
+        print(f"  {factor['factor'].replace('_', ' ').title():<24} {value} ({factor['effect']})")
+    print(f"Role family: {job.get('role_family', 'other')}" + (f" / {job['role_subfamily']}" if job.get('role_subfamily') else ""))
+    print(f"Eligibility: {job.get('eligibility_status', 'unknown').upper()}")
+    for reason in job.get("eligibility_reasons", []):
+        print(f"  - {reason['message']}")
     print(f"Recommendation: {job['recommendation']} | Category: {job['detected_category'] or 'Uncategorized'} | Seniority: {job['detected_seniority'] or 'Unspecified'} | Required experience: {job['required_experience_years'] if job['required_experience_years'] is not None else 'Unknown'}")
     print(f"Matching required skills: {joined('matching_required_skills')}")
     print(f"Matching preferred skills: {joined('matching_preferred_skills')}")
@@ -334,6 +471,60 @@ def show_job(job: dict[str, Any]) -> None:
         print(f"  - {reason}")
     print(f"Description summary: {summary or 'No description available'}")
     print(f"Apply URL: {job['apply_url']}")
+
+
+def application_package(database: Database, job: dict[str, Any], config_dir: Path) -> None:
+    profile, _, _ = load_configuration(config_dir)
+    requirements = extract_requirements(job["title"], job["description"], job.get("required_skills"))
+    coverage = map_evidence(requirements, profile)
+    variants_path = config_dir / "resume_variants.yaml"
+    variants = load_yaml(variants_path).get("resumes", {}) if variants_path.exists() else {}
+    resume = next((value.get("path") for value in variants.values()
+                   if job.get("role_family") in value.get("role_families", [])), None)
+    company_history = saturation(database.company_applications(job["company"]))
+    print("APPLICATION PACKAGE")
+    print(f"\nJob: {job['company']} - {job['title']}")
+    print(f"Company: {job['company']}\nRole family: {job.get('role_family', 'other')}")
+    print(f"\nRecommended resume: {resume or 'No matching resume variant configured'}")
+    print("\nStrongest candidate evidence:")
+    for item in coverage:
+        if item["state"] in {"strong_evidence", "related_evidence"}:
+            print(f"  - {item['requirement']}: {item['evidence']} ({item['state']})")
+    print("\nImportant JD keywords: " + (", ".join(requirements) or "None detected"))
+    gaps = [item["requirement"] for item in coverage if item["state"] == "no_profile_evidence"]
+    print("Possible gaps: " + (", ".join(gaps) or "None detected"))
+    print(f"Eligibility: {job.get('eligibility_status', 'unknown').upper()}")
+    print(f"Application effort: {job.get('estimated_effort_minutes') or 'unknown'}" + (" minutes" if job.get('estimated_effort_minutes') else ""))
+    print(f"Company saturation: {company_history['level'].upper()}")
+    if company_history["warning"]:
+        print(f"Warning: {company_history['warning']}")
+
+
+def print_analytics(database: Database) -> None:
+    data = summarize(database.analytics_rows())
+    print("APPLICATION FUNNEL")
+    for label, key in (("Total applications", "total"), ("Pending", "pending"), ("Rejected", "rejected"),
+                       ("Screens/interviews", "interviews"), ("Offers", "offers"), ("Withdrawn", "withdrawn")):
+        print(f"{label}: {data[key]}")
+    for label, key in (("Response rate", "response_rate"), ("Interview rate", "interview_rate"), ("Offer rate", "offer_rate")):
+        value = data[key]
+        print(f"{label}: {'Unavailable' if value is None else f'{value:.1f}%'}")
+    if data["small_sample"]: print("Note: overall sample is too small for a meaningful conversion estimate.")
+    for field, groups in data["groups"].items():
+        if not groups: continue
+        print(f"\nBY {field.replace('_', ' ').upper()}")
+        for name, group in groups.items():
+            suffix = " — insufficient sample" if group["small_sample"] else f" — interview rate {group['interview_rate']:.1f}%"
+            print(f"  {name}: {group['total']} applications{suffix}")
+
+
+def print_prep(job: dict[str, Any]) -> None:
+    topics = prep_topics(job.get("role_family", "other"), job["title"], job["description"])
+    print(f"INTERVIEW PREP\n\n{job['company']} - {job['title']}\nRole family: {job.get('role_family', 'other')}\n")
+    if not topics: print("No role-specific topics were confidently identified.")
+    else:
+        print("Relevant topics:")
+        for topic in topics: print(f"  - {topic}")
 
 
 def export_calibration(database: Database, output: Path) -> int:
@@ -398,8 +589,13 @@ def main(argv: list[str] | None = None) -> int:
         profile, preferences, _ = load_configuration(args.config_dir)
         stored = database.all_jobs()
         for job_id, job in stored:
-            database.save_score(job_id, score_job(job, profile, preferences))
+            scored = contextualize_priority(database, job_id, job, score_job(job, profile, preferences), profile, preferences)
+            database.save_score(job_id, scored)
         print(f"Rescored {len(stored)} stored jobs.")
+    elif args.command == "reanalyze":
+        database.initialize()
+        count = reanalyze(database, args.config_dir)
+        print(f"Reanalyzed {count} stored jobs at analysis version {ANALYSIS_VERSION}; overall scores and application history were preserved.")
     elif args.command == "list":
         database.initialize()
         list_jobs(database, args)
@@ -416,6 +612,44 @@ def main(argv: list[str] | None = None) -> int:
             print(f"Job {args.job_id} was not found.", file=sys.stderr)
             return 1
         show_job(job)
+    elif args.command == "package":
+        database.initialize(); job = database.get_job(args.job_id)
+        if job is None:
+            print(f"Job {args.job_id} was not found.", file=sys.stderr); return 1
+        application_package(database, job, args.config_dir)
+    elif args.command == "set-effort":
+        database.initialize()
+        try:
+            if not database.set_effort(args.job_id, args.minutes):
+                print(f"Job {args.job_id} was not found.", file=sys.stderr); return 1
+        except ValueError as exc:
+            print(str(exc), file=sys.stderr); return 2
+        profile, preferences, _ = load_configuration(args.config_dir)
+        stored_job = next((job for job_id, job in database.all_jobs() if job_id == args.job_id), None)
+        if stored_job is not None:
+            rescored = score_job(stored_job, profile, preferences)
+            database.save_score(args.job_id, contextualize_priority(database, args.job_id, stored_job, rescored, profile, preferences))
+        print(f"Set estimated application effort for job {args.job_id} to {args.minutes} minutes.")
+    elif args.command == "analytics":
+        database.initialize(); print_analytics(database)
+    elif args.command == "prep":
+        database.initialize(); job = database.get_job(args.job_id)
+        if job is None: print(f"Job {args.job_id} was not found.", file=sys.stderr); return 1
+        print_prep(job)
+    elif args.command == "answers":
+        path = args.config_dir / "application_answers.yaml"
+        if not path.exists():
+            print(f"Answer bank not found at {path}. Copy application_answers.example.yaml and keep it local.", file=sys.stderr)
+            return 1
+        answers = load_yaml(path)
+        if args.answer_key:
+            if args.answer_key not in answers:
+                print(f"Answer key '{args.answer_key}' was not found.", file=sys.stderr); return 1
+            print(answers[args.answer_key])
+        else:
+            print("APPLICATION ANSWER BANK\n")
+            print("Available keys:")
+            for key in sorted(answers): print(f"  - {key}")
     elif args.command == "report":
         database.initialize()
         followups = follow_up_rows(database, args.config_dir)
@@ -430,7 +664,7 @@ def main(argv: list[str] | None = None) -> int:
         try:
             applied_at = datetime.combine(args.date, datetime_time.min, tzinfo=timezone.utc) if args.date else None
             suppress = True if args.do_not_follow_up else False if args.allow_follow_up else None
-            if not database.update_status(args.job_id, args.status, applied_at, suppress):
+            if not database.update_status(args.job_id, args.status, applied_at, suppress, args.reason):
                 print(f"Job {args.job_id} was not found.", file=sys.stderr)
                 return 1
         except ValueError as exc:

@@ -66,3 +66,11 @@ class JobScore(BaseModel):
     rejected: bool = False
     explanation: str = ""
     recommendation: str
+    overall_score: float = Field(default=0, ge=0, le=100)
+    eligibility_status: str = "unknown"
+    eligibility_reasons: list[dict[str, str]] = Field(default_factory=list)
+    role_family: str = "other"
+    role_subfamily: str | None = None
+    role_evidence: list[str] = Field(default_factory=list)
+    priority_factors: list[dict[str, Any]] = Field(default_factory=list)
+    analysis_version: int = 0

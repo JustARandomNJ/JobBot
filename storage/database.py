@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import hashlib
+import shutil
 import sqlite3
 from contextlib import contextmanager, nullcontext
 from datetime import datetime, timezone
@@ -19,11 +21,17 @@ VALID_STATUSES = {
 VALID_REVIEWS = {"unreviewed", "strong match", "possible", "poor match", "irrelevant"}
 VALID_CONTACT_TYPES = {"recruiter", "hiring manager", "team member", "referral", "general recruiting contact", "unknown"}
 VALID_FOLLOW_UP_METHODS = {"email", "linkedin", "phone", "referral", "other"}
+VALID_SKIP_REASONS = {"ineligible", "student_only", "graduation_window", "experience_requirement",
+    "citizenship", "clearance", "export_control", "sponsorship", "location", "salary", "duplicate",
+    "stale", "application_closed", "application_unavailable", "already_applied_elsewhere",
+    "not_interested", "other"}
 JSON_FIELDS = {
     "required_skills", "preferred_skills", "source_metadata", "matching_skills",
     "matching_required_skills", "matching_preferred_skills", "missing_required_skills",
     "missing_preferred_skills", "eligibility_flags", "positive_reasons", "negative_reasons",
     "defense_eligibility_reasons", "eligibility_evidence_snippets",
+    "eligibility_reasons", "role_evidence",
+    "priority_factors",
 }
 
 
@@ -53,6 +61,7 @@ class Database:
             connection.close()
 
     def initialize(self) -> None:
+        self._backup_before_intelligence_migration()
         with self.connect() as connection:
             connection.executescript(
                 """
@@ -173,6 +182,26 @@ class Database:
                     note TEXT NOT NULL DEFAULT '',
                     updated_at TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS job_observations (
+                    id INTEGER PRIMARY KEY,
+                    job_id INTEGER NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
+                    observed_at TEXT NOT NULL,
+                    scan_id INTEGER,
+                    is_active INTEGER NOT NULL,
+                    description_fingerprint TEXT NOT NULL,
+                    canonical_url TEXT,
+                    requisition_id TEXT,
+                    description_changed INTEGER NOT NULL DEFAULT 0,
+                    reopened INTEGER NOT NULL DEFAULT 0
+                );
+                CREATE INDEX IF NOT EXISTS idx_job_observations_job_time
+                    ON job_observations(job_id, observed_at);
+                CREATE TABLE IF NOT EXISTS application_status_history (
+                    id INTEGER PRIMARY KEY,
+                    job_id INTEGER NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
+                    status TEXT NOT NULL,
+                    changed_at TEXT NOT NULL
+                );
                 """
             )
             self._migrate_columns(connection)
@@ -191,6 +220,44 @@ class Database:
                 """INSERT OR IGNORE INTO relevance_reviews (job_id, relevance, note, updated_at)
                    SELECT id, 'unreviewed', '', ? FROM jobs""", (now,)
             )
+            self._backfill_baseline_observations(connection)
+
+    @staticmethod
+    def _backfill_baseline_observations(connection: sqlite3.Connection) -> None:
+        """Record one honest migration baseline for jobs predating observations."""
+        rows = connection.execute(
+            """SELECT j.id,j.date_discovered,j.description,j.apply_url,j.external_id,j.source_metadata,j.is_active
+               FROM jobs j WHERE NOT EXISTS
+               (SELECT 1 FROM job_observations o WHERE o.job_id=j.id)"""
+        ).fetchall()
+        for row in rows:
+            fingerprint = hashlib.sha256(" ".join(row["description"].lower().split()).encode("utf-8")).hexdigest()
+            metadata = json.loads(row["source_metadata"] or "{}")
+            requisition = metadata.get("requisition_id") or metadata.get("requisitionId") or row["external_id"] or None
+            connection.execute(
+                """INSERT INTO job_observations
+                   (job_id,observed_at,scan_id,is_active,description_fingerprint,canonical_url,requisition_id,
+                    description_changed,reopened) VALUES (?,?,?,?,?,?,?,?,?)""",
+                (row["id"], row["date_discovered"], None, row["is_active"], fingerprint,
+                 normalize_url(row["apply_url"]), requisition, 0, 0),
+            )
+
+    def _backup_before_intelligence_migration(self) -> None:
+        """Create one timestamped copy before the first v2 schema change."""
+        if not self.path.exists() or self.path.stat().st_size == 0:
+            return
+        try:
+            probe = sqlite3.connect(self.path)
+            tables = {row[0] for row in probe.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+            probe.close()
+        except sqlite3.DatabaseError:
+            return
+        if not tables or "job_observations" in tables:
+            return
+        backup_dir = self.path.parent / "backups"
+        backup_dir.mkdir(parents=True, exist_ok=True)
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+        shutil.copy2(self.path, backup_dir / f"{self.path.stem}-{stamp}{self.path.suffix}.bak")
 
     @staticmethod
     def _migrate_columns(connection: sqlite3.Connection) -> None:
@@ -216,6 +283,11 @@ class Database:
                 "defense_eligibility_status": "TEXT NOT NULL DEFAULT 'no_special_requirement'",
                 "defense_eligibility_reasons": "TEXT NOT NULL DEFAULT '[]'",
                 "eligibility_evidence_snippets": "TEXT NOT NULL DEFAULT '[]'",
+                "overall_score": "REAL", "eligibility_status": "TEXT NOT NULL DEFAULT 'unknown'",
+                "eligibility_reasons": "TEXT NOT NULL DEFAULT '[]'", "role_family": "TEXT NOT NULL DEFAULT 'other'",
+                "role_subfamily": "TEXT", "role_evidence": "TEXT NOT NULL DEFAULT '[]'",
+                "priority_factors": "TEXT NOT NULL DEFAULT '[]'",
+                "analysis_version": "INTEGER NOT NULL DEFAULT 0",
             },
             "scan_history": {
                 "companies_succeeded": "INTEGER NOT NULL DEFAULT 0",
@@ -232,6 +304,8 @@ class Database:
                 "follow_up_count": "INTEGER NOT NULL DEFAULT 0", "next_follow_up_at": "TEXT",
                 "do_not_follow_up": "INTEGER NOT NULL DEFAULT 0",
                 "application_date_unknown": "INTEGER NOT NULL DEFAULT 0",
+                "skip_reason": "TEXT",
+                "estimated_effort_minutes": "INTEGER",
             },
         }
         for table, columns in migrations.items():
@@ -239,6 +313,7 @@ class Database:
             for name, definition in columns.items():
                 if name not in existing:
                     connection.execute(f"ALTER TABLE {table} ADD COLUMN {name} {definition}")
+        connection.execute("UPDATE job_scores SET overall_score=priority_score WHERE overall_score IS NULL")
 
     def upsert_job(self, job: Job, scan_id: int | None = None,
                    connection: sqlite3.Connection | None = None) -> tuple[int, bool]:
@@ -254,12 +329,13 @@ class Database:
         )
         with (self.connect() if connection is None else nullcontext(connection)) as connection:
             existing = connection.execute(
-                """SELECT id FROM jobs WHERE source=? AND external_id=? AND company=?
+                """SELECT id,is_active FROM jobs WHERE source=? AND external_id=? AND company=?
                    AND title=? AND normalized_apply_url=?""",
                 (job.source, job.external_id, job.company, job.title, normalized_apply_url),
             ).fetchone()
             if existing is not None:
                 job_id = int(existing["id"])
+                reopened = not bool(existing["is_active"])
                 connection.execute(
                     """UPDATE jobs SET location=?, employment_type=?, description=?, apply_url=?,
                        salary_text=?, date_posted=?, required_skills=?, preferred_skills=?,
@@ -274,6 +350,7 @@ class Database:
                         json.dumps(job.source_metadata), now, now, scan_id, job_id,
                     ),
                 )
+                self._record_observation(connection, job_id, job, now, scan_id, reopened)
                 return job_id, False
             cursor = connection.execute(
                 """INSERT INTO jobs (
@@ -290,11 +367,29 @@ class Database:
                 "INSERT INTO application_status (job_id, status, updated_at) VALUES (?, 'not reviewed', ?)",
                 (job_id, now),
             )
+            self._record_observation(connection, job_id, job, now, scan_id, False)
             connection.execute(
                 "INSERT INTO relevance_reviews (job_id, relevance, note, updated_at) VALUES (?, 'unreviewed', '', ?)",
                 (job_id, now),
             )
             return job_id, True
+
+    @staticmethod
+    def _record_observation(connection: sqlite3.Connection, job_id: int, job: Job, observed_at: str,
+                            scan_id: int | None, reopened: bool) -> None:
+        fingerprint = hashlib.sha256(" ".join(job.description.lower().split()).encode("utf-8")).hexdigest()
+        previous = connection.execute(
+            "SELECT description_fingerprint FROM job_observations WHERE job_id=? ORDER BY id DESC LIMIT 1", (job_id,)
+        ).fetchone()
+        metadata = job.source_metadata or {}
+        requisition = metadata.get("requisition_id") or metadata.get("requisitionId") or job.external_id or None
+        connection.execute(
+            """INSERT INTO job_observations
+               (job_id,observed_at,scan_id,is_active,description_fingerprint,canonical_url,requisition_id,
+                description_changed,reopened) VALUES (?,?,?,?,?,?,?,?,?)""",
+            (job_id, observed_at, scan_id, 1, fingerprint, normalize_url(job.apply_url), requisition,
+             int(previous is not None and previous[0] != fingerprint), int(reopened)),
+        )
 
     def save_score(self, job_id: int, score: JobScore,
                    connection: sqlite3.Connection | None = None) -> None:
@@ -311,7 +406,10 @@ class Database:
             int(score.active_clearance_required), int(score.clearance_eligibility_required),
             score.work_authorization_eligibility, score.defense_eligibility_status,
             json.dumps(score.defense_eligibility_reasons), json.dumps(score.eligibility_evidence_snippets),
-            datetime.now(timezone.utc).isoformat(),
+            datetime.now(timezone.utc).isoformat(), score.overall_score, score.eligibility_status,
+            json.dumps(score.eligibility_reasons), score.role_family, score.role_subfamily,
+            json.dumps(score.role_evidence), json.dumps(score.priority_factors),
+            score.analysis_version,
         )
         with (self.connect() if connection is None else nullcontext(connection)) as connection:
             connection.execute(
@@ -323,8 +421,10 @@ class Database:
                     rejected, explanation, recommendation, citizenship_requirement,
                     export_control_requirement, security_clearance_requirement, required_clearance_level,
                     active_clearance_required, clearance_eligibility_required, work_authorization_eligibility,
-                    defense_eligibility_status, defense_eligibility_reasons, eligibility_evidence_snippets, scored_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    defense_eligibility_status, defense_eligibility_reasons, eligibility_evidence_snippets, scored_at,
+                    overall_score, eligibility_status, eligibility_reasons, role_family, role_subfamily, role_evidence,
+                    priority_factors, analysis_version
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(job_id) DO UPDATE SET
                   fit_score=excluded.fit_score, competitiveness_score=excluded.competitiveness_score,
                   preference_score=excluded.preference_score, recency_score=excluded.recency_score,
@@ -347,6 +447,11 @@ class Database:
                   defense_eligibility_status=excluded.defense_eligibility_status,
                   defense_eligibility_reasons=excluded.defense_eligibility_reasons,
                   eligibility_evidence_snippets=excluded.eligibility_evidence_snippets,
+                  overall_score=excluded.overall_score, eligibility_status=excluded.eligibility_status,
+                  eligibility_reasons=excluded.eligibility_reasons, role_family=excluded.role_family,
+                  role_subfamily=excluded.role_subfamily, role_evidence=excluded.role_evidence,
+                  priority_factors=excluded.priority_factors,
+                  analysis_version=excluded.analysis_version,
                   scored_at=excluded.scored_at""",
                 values,
             )
@@ -390,19 +495,19 @@ class Database:
             clauses.append(f"a.status IN ({placeholders})")
             params.extend(sorted(statuses))
         if eligibility == "eligible":
-            clauses.append("s.defense_eligibility_status IN ('eligible', 'no_special_requirement')")
+            clauses.append("s.eligibility_status = 'eligible'")
         elif eligibility == "manual_review":
-            clauses.append("s.defense_eligibility_status = 'manual_review'")
+            clauses.append("s.eligibility_status = 'manual_review'")
         elif eligibility == "ineligible":
-            clauses.append("s.defense_eligibility_status IN ('ineligible_citizenship', 'ineligible_clearance')")
+            clauses.append("s.eligibility_status = 'ineligible'")
         elif eligibility == "not_ineligible":
-            clauses.append("s.defense_eligibility_status NOT IN ('ineligible_citizenship', 'ineligible_clearance')")
+            clauses.append("s.eligibility_status <> 'ineligible'")
         limit_sql = "" if limit is None else " LIMIT ?"
         if limit is not None:
             params.append(limit)
         with self.connect() as connection:
             rows = connection.execute(
-                f"""SELECT j.*, s.*, a.status,a.applied_at,a.last_follow_up_at,a.follow_up_count,
+                f"""SELECT j.*, s.*, a.status,a.skip_reason,a.estimated_effort_minutes,a.applied_at,a.last_follow_up_at,a.follow_up_count,
                           a.next_follow_up_at,a.do_not_follow_up,r.relevance, r.note AS review_note,
                           (SELECT max(id) FROM scan_history WHERE completed_at IS NOT NULL) AS latest_scan_id
                    FROM jobs j
@@ -420,8 +525,14 @@ class Database:
     def get_job(self, job_id: int) -> dict[str, Any] | None:
         with self.connect() as connection:
             row = connection.execute(
-                """SELECT j.*, s.*, a.status,a.applied_at,a.last_follow_up_at,a.follow_up_count,
+                """SELECT j.*, s.*, a.status,a.skip_reason,a.estimated_effort_minutes,a.applied_at,a.last_follow_up_at,a.follow_up_count,
                           a.next_follow_up_at,a.do_not_follow_up,r.relevance, r.note AS review_note,
+                          (SELECT count(*) FROM job_observations o WHERE o.job_id=j.id) AS times_seen,
+                          (SELECT count(*) FROM job_observations o WHERE o.job_id=j.id AND o.reopened=1) AS reopened_count,
+                          (SELECT count(*) FROM job_observations o WHERE o.job_id=j.id AND o.description_changed=1) AS description_changes,
+                          (SELECT max(observed_at) FROM job_observations o WHERE o.job_id=j.id AND o.reopened=1) AS reopened_at,
+                          (SELECT status FROM application_status_history h WHERE h.job_id=j.id
+                           AND h.status IN ('rejected','withdrawn','no response') ORDER BY h.id DESC LIMIT 1) AS previous_result,
                           (SELECT max(id) FROM scan_history WHERE completed_at IS NOT NULL) AS latest_scan_id
                    FROM jobs j JOIN job_scores s ON s.job_id=j.id
                    JOIN application_status a ON a.job_id=j.id
@@ -512,6 +623,18 @@ class Database:
                     """UPDATE jobs SET missing_scan_count=?, is_active=?, closed_at=? WHERE id=?""",
                     (count, int(count < 2), now if count >= 2 else None, int(row["id"])),
                 )
+                if count >= 2:
+                    previous = connection.execute(
+                        "SELECT description_fingerprint,canonical_url,requisition_id FROM job_observations WHERE job_id=? ORDER BY id DESC LIMIT 1",
+                        (int(row["id"]),),
+                    ).fetchone()
+                    if previous:
+                        connection.execute(
+                            """INSERT INTO job_observations
+                               (job_id,observed_at,scan_id,is_active,description_fingerprint,canonical_url,requisition_id)
+                               VALUES (?,?,?,?,?,?,?)""",
+                            (int(row["id"]), now, None, 0, previous[0], previous[1], previous[2]),
+                        )
             return newly_inactive
 
     def count_active_above(self, minimum_score: float, first_seen_scan_id: int | None = None) -> int:
@@ -524,10 +647,16 @@ class Database:
             return int(connection.execute(sql, params).fetchone()[0])
 
     def update_status(self, job_id: int, status: str, applied_at: datetime | None = None,
-                      do_not_follow_up: bool | None = None) -> bool:
+                      do_not_follow_up: bool | None = None, skip_reason: str | None = None) -> bool:
         normalized = status.strip().lower().replace("_", "-").replace("-", " ")
         if normalized not in VALID_STATUSES:
             raise ValueError(f"Unknown status. Choose one of: {', '.join(sorted(VALID_STATUSES))}")
+        if skip_reason is not None:
+            skip_reason = skip_reason.strip().lower().replace("-", "_")
+            if normalized != "skipped":
+                raise ValueError("--reason is only valid when status is skipped")
+            if skip_reason not in VALID_SKIP_REASONS:
+                raise ValueError(f"Unknown skip reason. Choose one of: {', '.join(sorted(VALID_SKIP_REASONS))}")
         with self.connect() as connection:
             existing = connection.execute(
                 "SELECT status,applied_at,application_date_unknown FROM application_status WHERE job_id=?", (job_id,)
@@ -547,10 +676,59 @@ class Database:
             ).fetchone()[0]
             cursor = connection.execute(
                 """UPDATE application_status SET status=?,updated_at=?,applied_at=?,
-                   do_not_follow_up=?,application_date_unknown=? WHERE job_id=?""",
-                (normalized, datetime.now(timezone.utc).isoformat(), application_date, suppression, date_unknown, job_id),
+                   do_not_follow_up=?,application_date_unknown=?,skip_reason=? WHERE job_id=?""",
+                (normalized, datetime.now(timezone.utc).isoformat(), application_date, suppression, date_unknown,
+                 skip_reason if normalized == "skipped" else None, job_id),
+            )
+            connection.execute(
+                "INSERT INTO application_status_history(job_id,status,changed_at) VALUES (?,?,?)",
+                (job_id, normalized, datetime.now(timezone.utc).isoformat()),
             )
             return cursor.rowcount == 1
+
+    def set_effort(self, job_id: int, minutes: int) -> bool:
+        if minutes < 1:
+            raise ValueError("Application effort must be at least one minute.")
+        with self.connect() as connection:
+            cursor = connection.execute(
+                "UPDATE application_status SET estimated_effort_minutes=?,updated_at=? WHERE job_id=?",
+                (minutes, datetime.now(timezone.utc).isoformat(), job_id),
+            )
+            return cursor.rowcount == 1
+
+    def company_applications(self, company: str) -> list[dict[str, Any]]:
+        with self.connect() as connection:
+            rows = connection.execute(
+                """SELECT a.status,a.applied_at,s.role_family FROM application_status a
+                   JOIN jobs j ON j.id=a.job_id LEFT JOIN job_scores s ON s.job_id=j.id
+                   WHERE lower(j.company)=lower(?) AND a.status NOT IN ('not reviewed','saved','skipped')""", (company,),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def analytics_rows(self) -> list[dict[str, Any]]:
+        with self.connect() as connection:
+            rows = connection.execute(
+                """SELECT a.status,a.skip_reason,a.applied_at,j.company,j.source,j.date_posted,
+                          s.overall_score,s.priority_score,s.role_family,s.eligibility_status
+                   FROM application_status a JOIN jobs j ON j.id=a.job_id
+                   LEFT JOIN job_scores s ON s.job_id=j.id WHERE a.status NOT IN ('not reviewed','saved')"""
+            ).fetchall()
+        now = datetime.now(timezone.utc)
+        output = []
+        for raw in rows:
+            row = dict(raw)
+            def band(value: Any) -> str | None:
+                if value is None: return None
+                return "80-100" if value >= 80 else "60-79" if value >= 60 else "40-59" if value >= 40 else "0-39"
+            row["fit_band"] = band(row.get("overall_score")); row["priority_band"] = band(row.get("priority_score"))
+            if row.get("date_posted"):
+                posted = datetime.fromisoformat(row["date_posted"]); posted = posted if posted.tzinfo else posted.replace(tzinfo=timezone.utc)
+                days = max(0, (now-posted).days); row["freshness_band"] = "0-7 days" if days <= 7 else "8-30 days" if days <= 30 else "30+ days"
+            if row.get("applied_at"):
+                applied = datetime.fromisoformat(row["applied_at"]); applied = applied if applied.tzinfo else applied.replace(tzinfo=timezone.utc)
+                days = max(0, (now-applied).days); row["application_age_band"] = "0-14 days" if days <= 14 else "15-30 days" if days <= 30 else "30+ days"
+            output.append(row)
+        return output
 
     def add_contact(self, job_id: int, *, name: str, contact_type: str, role_title: str | None = None,
                     email: str | None = None, profile_url: str | None = None,

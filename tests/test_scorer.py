@@ -15,7 +15,8 @@ def test_priority_score_uses_documented_weights() -> None:
     job = Job(title="Firmware Engineer", location="San Francisco, CA", employment_type="Full-time", description="Entry level firmware using C++, Python, Linux and STM32. Computer engineering degree.", required_skills=["C++", "Python", "Linux"], date_posted=datetime(2026, 8, 5, tzinfo=timezone.utc), remote_status="hybrid")
     score = score_job(job, PROFILE, PREFERENCES, now=datetime(2026, 8, 6, tzinfo=timezone.utc))
     expected = .40 * score.fit_score + .25 * score.competitiveness_score + .20 * score.preference_score + .15 * score.recency_score
-    assert score.priority_score == pytest.approx(expected, abs=.1)
+    assert score.overall_score == pytest.approx(expected, abs=.1)
+    assert score.priority_score != score.overall_score
     assert score.matching_skills
 
 
@@ -53,3 +54,15 @@ def test_generic_engineer_titles_do_not_inherit_specialized_categories() -> None
         score = score_job(job, PROFILE, PREFERENCES, now=now)
         assert score.preference_score <= 25
         assert score.priority_score < 70
+
+
+def test_string_degree_profile_is_supported() -> None:
+    score = score_job(Job(title="Engineer", description="Bachelor of Science in Computer Engineering"),
+                      {"degree": "Bachelor of Science in Computer Engineering"}, {"eligibility": {}})
+    assert score.fit_score > 0
+
+
+def test_structured_projects_are_supported() -> None:
+    profile = {"projects_and_technologies": [{"name": "Vehicle", "technologies": ["CAN", "RTOS"]}]}
+    score = score_job(Job(title="Firmware Engineer", description="CAN RTOS firmware"), profile, {"eligibility": {}})
+    assert score.fit_score > 0

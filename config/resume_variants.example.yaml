@@ -1,0 +1,10 @@
+resumes:
+  embedded:
+    path: resumes/embedded.pdf
+    role_families: [firmware, embedded_firmware, embedded_linux, bsp_drivers]
+  asic:
+    path: resumes/asic.pdf
+    role_families: [fpga, asic_rtl, asic_design_verification]
+  software:
+    path: resumes/software.pdf
+    role_families: [general_software, systems]

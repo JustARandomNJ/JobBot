@@ -8,10 +8,25 @@ from typing import Any
 from models.job import Job, JobScore
 from ranking.eligibility import evaluate_eligibility
 from ranking.skill_match import SkillMatch, match_skills
+from ranking.role_classifier import classify_role
+from ranking.posting_health import freshness_score
+from ranking.priority import calculate_priority
+
+ANALYSIS_VERSION = 2
 
 
 def _clamp(value: float) -> float:
     return round(max(0.0, min(100.0, value)), 1)
+
+
+def _profile_terms(value: Any) -> list[str]:
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, list):
+        return [term for item in value for term in _profile_terms(item)]
+    if isinstance(value, dict):
+        return [term for item in value.values() for term in _profile_terms(item)]
+    return []
 
 
 def _category(job: Job, preferences: dict[str, Any]) -> tuple[str | None, float]:
@@ -90,9 +105,10 @@ def score_job(job: Job, profile: dict[str, Any], preferences: dict[str, Any], no
     eligibility = evaluate_eligibility(job, preferences, profile)
     match = match_skills(job, profile)
     category, category_score = _category(job, preferences)
-    degree_terms = profile.get("degree", {}).get("keywords", [])
+    configured_degree = profile.get("degree", {})
+    degree_terms = configured_degree.get("keywords", []) if isinstance(configured_degree, dict) else [str(configured_degree)]
     degree_relevance = 100.0 if any(term.lower() in job.description.lower() for term in degree_terms) else 55.0
-    project_terms = profile.get("projects_and_technologies", [])
+    project_terms = _profile_terms(profile.get("projects_and_technologies", []))
     project_hits = sum(term.lower() in job.description.lower() for term in project_terms)
     project_score = min(100.0, project_hits * 20.0)
     fit = _clamp(0.55 * match.weighted_score + 0.25 * category_score + 0.10 * degree_relevance + 0.10 * project_score)
@@ -138,9 +154,17 @@ def score_job(job: Job, profile: dict[str, Any], preferences: dict[str, Any], no
     explanation = f"Recommended: {recommendation}. " + " ".join(f"{reason}." for reason in positive_reasons)
     if negative_reasons:
         explanation += " " + " ".join(f"{reason}." for reason in negative_reasons)
+    role = classify_role(job)
+    role_weights = profile.get("target_role_weights", {})
+    application_priority, priority_factors = calculate_priority(
+        overall_score=priority, eligibility=eligibility.eligibility_status,
+        role_weight=role_weights.get(role.role_family) if role_weights else None,
+        freshness=freshness_score(job.date_posted, preferences.get("posting_health", {}), now)[0],
+        config=preferences.get("priority", {}),
+    )
     return JobScore(
         fit_score=fit, competitiveness_score=competitiveness, preference_score=preference_score,
-        recency_score=recency, priority_score=priority, detected_category=category,
+        recency_score=recency, priority_score=application_priority, detected_category=category,
         detected_seniority=_seniority(job, eligibility.entry_level_signals), matching_skills=match.matching,
         matching_required_skills=match.matching_required,
         matching_preferred_skills=match.matching_preferred,
@@ -157,4 +181,9 @@ def score_job(job: Job, profile: dict[str, Any], preferences: dict[str, Any], no
         defense_eligibility_reasons=eligibility.defense_eligibility_reasons,
         eligibility_evidence_snippets=eligibility.eligibility_evidence_snippets,
         rejected=eligibility.rejected, explanation=explanation, recommendation=recommendation,
+        overall_score=priority, eligibility_status=eligibility.eligibility_status,
+        eligibility_reasons=eligibility.structured_reasons, role_family=role.role_family,
+        role_subfamily=role.role_subfamily, role_evidence=list(role.evidence),
+        priority_factors=priority_factors,
+        analysis_version=ANALYSIS_VERSION,
     )

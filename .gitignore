@@ -1,4 +1,6 @@
 .venv/
+.env
+.env.*
 __pycache__/
 *.py[cod]
 .pytest_cache/
@@ -9,8 +11,13 @@ data/*.db
 data/*.db-*
 data/*.sqlite*
 data/report.html
+data/reports/
+generated_reports/
 data/calibration.csv
+data/backups/
 *.log
 
 config/candidate_profile.yaml
-config/candidate_profile.yaml
+config/resume_variants.yaml
+config/application_answers.yaml
+resumes/
