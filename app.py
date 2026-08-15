@@ -341,6 +341,10 @@ def show_job(job: dict[str, Any]) -> None:
         print(f"  Reopened: {job['reopened_at'][:10]}")
     print(f"Technical fit score: {job.get('overall_score', job['priority_score']):.1f}")
     print(f"Application priority: {job['priority_score']:.1f}")
+    print("Priority factors")
+    for factor in job.get("priority_factors", []):
+        value = "unknown" if factor.get("value") is None else factor.get("value")
+        print(f"  {factor['factor'].replace('_', ' ').title():<24} {value} ({factor['effect']})")
     print(f"Role family: {job.get('role_family', 'other')}" + (f" / {job['role_subfamily']}" if job.get('role_subfamily') else ""))
     print(f"Eligibility: {job.get('eligibility_status', 'unknown').upper()}")
     for reason in job.get("eligibility_reasons", []):

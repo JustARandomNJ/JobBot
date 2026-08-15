@@ -31,6 +31,7 @@ JSON_FIELDS = {
     "missing_preferred_skills", "eligibility_flags", "positive_reasons", "negative_reasons",
     "defense_eligibility_reasons", "eligibility_evidence_snippets",
     "eligibility_reasons", "role_evidence",
+    "priority_factors",
 }
 
 
@@ -264,6 +265,7 @@ class Database:
                 "overall_score": "REAL", "eligibility_status": "TEXT NOT NULL DEFAULT 'unknown'",
                 "eligibility_reasons": "TEXT NOT NULL DEFAULT '[]'", "role_family": "TEXT NOT NULL DEFAULT 'other'",
                 "role_subfamily": "TEXT", "role_evidence": "TEXT NOT NULL DEFAULT '[]'",
+                "priority_factors": "TEXT NOT NULL DEFAULT '[]'",
             },
             "scan_history": {
                 "companies_succeeded": "INTEGER NOT NULL DEFAULT 0",
@@ -384,7 +386,7 @@ class Database:
             json.dumps(score.defense_eligibility_reasons), json.dumps(score.eligibility_evidence_snippets),
             datetime.now(timezone.utc).isoformat(), score.overall_score, score.eligibility_status,
             json.dumps(score.eligibility_reasons), score.role_family, score.role_subfamily,
-            json.dumps(score.role_evidence),
+            json.dumps(score.role_evidence), json.dumps(score.priority_factors),
         )
         with (self.connect() if connection is None else nullcontext(connection)) as connection:
             connection.execute(
@@ -397,8 +399,9 @@ class Database:
                     export_control_requirement, security_clearance_requirement, required_clearance_level,
                     active_clearance_required, clearance_eligibility_required, work_authorization_eligibility,
                     defense_eligibility_status, defense_eligibility_reasons, eligibility_evidence_snippets, scored_at,
-                    overall_score, eligibility_status, eligibility_reasons, role_family, role_subfamily, role_evidence
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    overall_score, eligibility_status, eligibility_reasons, role_family, role_subfamily, role_evidence,
+                    priority_factors
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(job_id) DO UPDATE SET
                   fit_score=excluded.fit_score, competitiveness_score=excluded.competitiveness_score,
                   preference_score=excluded.preference_score, recency_score=excluded.recency_score,
@@ -424,6 +427,7 @@ class Database:
                   overall_score=excluded.overall_score, eligibility_status=excluded.eligibility_status,
                   eligibility_reasons=excluded.eligibility_reasons, role_family=excluded.role_family,
                   role_subfamily=excluded.role_subfamily, role_evidence=excluded.role_evidence,
+                  priority_factors=excluded.priority_factors,
                   scored_at=excluded.scored_at""",
                 values,
             )

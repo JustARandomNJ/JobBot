@@ -9,6 +9,8 @@ from models.job import Job, JobScore
 from ranking.eligibility import evaluate_eligibility
 from ranking.skill_match import SkillMatch, match_skills
 from ranking.role_classifier import classify_role
+from ranking.posting_health import freshness_score
+from ranking.priority import calculate_priority
 
 
 def _clamp(value: float) -> float:
@@ -140,9 +142,20 @@ def score_job(job: Job, profile: dict[str, Any], preferences: dict[str, Any], no
     if negative_reasons:
         explanation += " " + " ".join(f"{reason}." for reason in negative_reasons)
     role = classify_role(job)
+    role_weights = profile.get("target_role_weights", {})
+    # Profiles without v2 role preferences retain the historical aggregate
+    # during migration. Once configured, priority gets its distinct meaning.
+    application_priority, priority_factors = calculate_priority(
+        overall_score=priority, eligibility=eligibility.eligibility_status,
+        role_weight=role_weights.get(role.role_family) if role_weights else None,
+        freshness=freshness_score(job.date_posted, preferences.get("posting_health", {}), now)[0],
+        config=preferences.get("priority", {}),
+    )
+    if not role_weights and eligibility.eligibility_status not in {"ineligible", "manual_review"}:
+        application_priority = priority
     return JobScore(
         fit_score=fit, competitiveness_score=competitiveness, preference_score=preference_score,
-        recency_score=recency, priority_score=priority, detected_category=category,
+        recency_score=recency, priority_score=application_priority, detected_category=category,
         detected_seniority=_seniority(job, eligibility.entry_level_signals), matching_skills=match.matching,
         matching_required_skills=match.matching_required,
         matching_preferred_skills=match.matching_preferred,
@@ -162,4 +175,5 @@ def score_job(job: Job, profile: dict[str, Any], preferences: dict[str, Any], no
         overall_score=priority, eligibility_status=eligibility.eligibility_status,
         eligibility_reasons=eligibility.structured_reasons, role_family=role.role_family,
         role_subfamily=role.role_subfamily, role_evidence=list(role.evidence),
+        priority_factors=priority_factors,
     )

@@ -72,3 +72,4 @@ class JobScore(BaseModel):
     role_family: str = "other"
     role_subfamily: str | None = None
     role_evidence: list[str] = Field(default_factory=list)
+    priority_factors: list[dict[str, Any]] = Field(default_factory=list)
