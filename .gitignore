@@ -15,4 +15,5 @@ data/backups/
 
 config/candidate_profile.yaml
 config/resume_variants.yaml
+config/application_answers.yaml
 resumes/

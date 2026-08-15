@@ -114,6 +114,8 @@ def build_parser() -> argparse.ArgumentParser:
     commands.add_parser("analytics", help="Show application funnel analytics")
     prep = commands.add_parser("prep", help="Generate deterministic interview preparation")
     prep.add_argument("job_id", type=int)
+    answers = commands.add_parser("answers", help="List local application-answer keys")
+    answers.add_argument("--get", dest="answer_key", help="Print one answer value")
     report = commands.add_parser("report", help="Write a local static HTML report")
     report.add_argument("--output", type=Path, default=DEFAULT_REPORT)
     status = commands.add_parser("update-status", help="Update application workflow status")
@@ -564,6 +566,20 @@ def main(argv: list[str] | None = None) -> int:
         database.initialize(); job = database.get_job(args.job_id)
         if job is None: print(f"Job {args.job_id} was not found.", file=sys.stderr); return 1
         print_prep(job)
+    elif args.command == "answers":
+        path = args.config_dir / "application_answers.yaml"
+        if not path.exists():
+            print(f"Answer bank not found at {path}. Copy application_answers.example.yaml and keep it local.", file=sys.stderr)
+            return 1
+        answers = load_yaml(path)
+        if args.answer_key:
+            if args.answer_key not in answers:
+                print(f"Answer key '{args.answer_key}' was not found.", file=sys.stderr); return 1
+            print(answers[args.answer_key])
+        else:
+            print("APPLICATION ANSWER BANK\n")
+            print("Available keys:")
+            for key in sorted(answers): print(f"  - {key}")
     elif args.command == "report":
         database.initialize()
         followups = follow_up_rows(database, args.config_dir)
