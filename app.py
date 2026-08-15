@@ -16,6 +16,7 @@ import requests
 from collectors import AshbyCollector, GreenhouseCollector, LeverCollector
 from config_loader import load_configuration
 from ranking.scorer import score_job
+from ranking.posting_health import freshness_score, repost_risk
 from ranking.follow_up import add_business_days, rank_follow_ups
 from reports.html_report import generate_report
 from storage.database import (Database, VALID_CONTACT_TYPES, VALID_FOLLOW_UP_METHODS,
@@ -314,6 +315,23 @@ def show_job(job: dict[str, Any]) -> None:
     if job["review_note"]:
         print(f"Review note: {job['review_note']}")
     print(f"Discovered: {job['date_discovered']} | Last seen: {job['last_seen_at'] or 'Unknown'} | Posted: {job['date_posted'] or 'Unknown'}")
+    freshness, freshness_band = freshness_score(job.get("date_posted"))
+    discovered = datetime.fromisoformat(job["date_discovered"])
+    discovered = discovered if discovered.tzinfo else discovered.replace(tzinfo=timezone.utc)
+    age_days = max(0.0, (datetime.now(timezone.utc) - discovered).total_seconds() / 86400)
+    risk, risk_reasons = repost_risk(age_days=age_days, reopened_count=job.get("reopened_count", 0),
+                                     times_seen=job.get("times_seen", 1),
+                                     description_changes=job.get("description_changes", 0))
+    print("Posting health")
+    print(f"  Times observed: {job.get('times_seen', 1)} | Description changes: {job.get('description_changes', 0)}")
+    print(f"  Freshness: {freshness:.1f} ({freshness_band}) | Repost risk: {risk.upper()}")
+    for reason in risk_reasons:
+        print(f"  - {reason}")
+    if job.get("reopened_at"):
+        print("REOPENED POSITION")
+        print(f"  Previous application: {(job.get('applied_at') or 'Unknown')[:10]}")
+        print(f"  Previous result: {job.get('previous_result') or 'Unknown'}")
+        print(f"  Reopened: {job['reopened_at'][:10]}")
     print(f"Technical fit score: {job.get('overall_score', job['priority_score']):.1f}")
     print(f"Application priority: {job['priority_score']:.1f}")
     print(f"Role family: {job.get('role_family', 'other')}" + (f" / {job['role_subfamily']}" if job.get('role_subfamily') else ""))

@@ -10,6 +10,7 @@ data/*.db-*
 data/*.sqlite*
 data/report.html
 data/calibration.csv
+data/backups/
 *.log
 
 config/candidate_profile.yaml

@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import hashlib
+import shutil
 import sqlite3
 from contextlib import contextmanager, nullcontext
 from datetime import datetime, timezone
@@ -58,6 +60,7 @@ class Database:
             connection.close()
 
     def initialize(self) -> None:
+        self._backup_before_intelligence_migration()
         with self.connect() as connection:
             connection.executescript(
                 """
@@ -178,6 +181,26 @@ class Database:
                     note TEXT NOT NULL DEFAULT '',
                     updated_at TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS job_observations (
+                    id INTEGER PRIMARY KEY,
+                    job_id INTEGER NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
+                    observed_at TEXT NOT NULL,
+                    scan_id INTEGER,
+                    is_active INTEGER NOT NULL,
+                    description_fingerprint TEXT NOT NULL,
+                    canonical_url TEXT,
+                    requisition_id TEXT,
+                    description_changed INTEGER NOT NULL DEFAULT 0,
+                    reopened INTEGER NOT NULL DEFAULT 0
+                );
+                CREATE INDEX IF NOT EXISTS idx_job_observations_job_time
+                    ON job_observations(job_id, observed_at);
+                CREATE TABLE IF NOT EXISTS application_status_history (
+                    id INTEGER PRIMARY KEY,
+                    job_id INTEGER NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
+                    status TEXT NOT NULL,
+                    changed_at TEXT NOT NULL
+                );
                 """
             )
             self._migrate_columns(connection)
@@ -196,6 +219,23 @@ class Database:
                 """INSERT OR IGNORE INTO relevance_reviews (job_id, relevance, note, updated_at)
                    SELECT id, 'unreviewed', '', ? FROM jobs""", (now,)
             )
+
+    def _backup_before_intelligence_migration(self) -> None:
+        """Create one timestamped copy before the first v2 schema change."""
+        if not self.path.exists() or self.path.stat().st_size == 0:
+            return
+        try:
+            probe = sqlite3.connect(self.path)
+            tables = {row[0] for row in probe.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+            probe.close()
+        except sqlite3.DatabaseError:
+            return
+        if not tables or "job_observations" in tables:
+            return
+        backup_dir = self.path.parent / "backups"
+        backup_dir.mkdir(parents=True, exist_ok=True)
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+        shutil.copy2(self.path, backup_dir / f"{self.path.stem}-{stamp}{self.path.suffix}.bak")
 
     @staticmethod
     def _migrate_columns(connection: sqlite3.Connection) -> None:
@@ -264,12 +304,13 @@ class Database:
         )
         with (self.connect() if connection is None else nullcontext(connection)) as connection:
             existing = connection.execute(
-                """SELECT id FROM jobs WHERE source=? AND external_id=? AND company=?
+                """SELECT id,is_active FROM jobs WHERE source=? AND external_id=? AND company=?
                    AND title=? AND normalized_apply_url=?""",
                 (job.source, job.external_id, job.company, job.title, normalized_apply_url),
             ).fetchone()
             if existing is not None:
                 job_id = int(existing["id"])
+                reopened = not bool(existing["is_active"])
                 connection.execute(
                     """UPDATE jobs SET location=?, employment_type=?, description=?, apply_url=?,
                        salary_text=?, date_posted=?, required_skills=?, preferred_skills=?,
@@ -284,6 +325,7 @@ class Database:
                         json.dumps(job.source_metadata), now, now, scan_id, job_id,
                     ),
                 )
+                self._record_observation(connection, job_id, job, now, scan_id, reopened)
                 return job_id, False
             cursor = connection.execute(
                 """INSERT INTO jobs (
@@ -300,11 +342,29 @@ class Database:
                 "INSERT INTO application_status (job_id, status, updated_at) VALUES (?, 'not reviewed', ?)",
                 (job_id, now),
             )
+            self._record_observation(connection, job_id, job, now, scan_id, False)
             connection.execute(
                 "INSERT INTO relevance_reviews (job_id, relevance, note, updated_at) VALUES (?, 'unreviewed', '', ?)",
                 (job_id, now),
             )
             return job_id, True
+
+    @staticmethod
+    def _record_observation(connection: sqlite3.Connection, job_id: int, job: Job, observed_at: str,
+                            scan_id: int | None, reopened: bool) -> None:
+        fingerprint = hashlib.sha256(" ".join(job.description.lower().split()).encode("utf-8")).hexdigest()
+        previous = connection.execute(
+            "SELECT description_fingerprint FROM job_observations WHERE job_id=? ORDER BY id DESC LIMIT 1", (job_id,)
+        ).fetchone()
+        metadata = job.source_metadata or {}
+        requisition = metadata.get("requisition_id") or metadata.get("requisitionId") or job.external_id or None
+        connection.execute(
+            """INSERT INTO job_observations
+               (job_id,observed_at,scan_id,is_active,description_fingerprint,canonical_url,requisition_id,
+                description_changed,reopened) VALUES (?,?,?,?,?,?,?,?,?)""",
+            (job_id, observed_at, scan_id, 1, fingerprint, normalize_url(job.apply_url), requisition,
+             int(previous is not None and previous[0] != fingerprint), int(reopened)),
+        )
 
     def save_score(self, job_id: int, score: JobScore,
                    connection: sqlite3.Connection | None = None) -> None:
@@ -438,6 +498,12 @@ class Database:
             row = connection.execute(
                 """SELECT j.*, s.*, a.status,a.skip_reason,a.applied_at,a.last_follow_up_at,a.follow_up_count,
                           a.next_follow_up_at,a.do_not_follow_up,r.relevance, r.note AS review_note,
+                          (SELECT count(*) FROM job_observations o WHERE o.job_id=j.id) AS times_seen,
+                          (SELECT count(*) FROM job_observations o WHERE o.job_id=j.id AND o.reopened=1) AS reopened_count,
+                          (SELECT count(*) FROM job_observations o WHERE o.job_id=j.id AND o.description_changed=1) AS description_changes,
+                          (SELECT max(observed_at) FROM job_observations o WHERE o.job_id=j.id AND o.reopened=1) AS reopened_at,
+                          (SELECT status FROM application_status_history h WHERE h.job_id=j.id
+                           AND h.status IN ('rejected','withdrawn','no response') ORDER BY h.id DESC LIMIT 1) AS previous_result,
                           (SELECT max(id) FROM scan_history WHERE completed_at IS NOT NULL) AS latest_scan_id
                    FROM jobs j JOIN job_scores s ON s.job_id=j.id
                    JOIN application_status a ON a.job_id=j.id
@@ -528,6 +594,18 @@ class Database:
                     """UPDATE jobs SET missing_scan_count=?, is_active=?, closed_at=? WHERE id=?""",
                     (count, int(count < 2), now if count >= 2 else None, int(row["id"])),
                 )
+                if count >= 2:
+                    previous = connection.execute(
+                        "SELECT description_fingerprint,canonical_url,requisition_id FROM job_observations WHERE job_id=? ORDER BY id DESC LIMIT 1",
+                        (int(row["id"]),),
+                    ).fetchone()
+                    if previous:
+                        connection.execute(
+                            """INSERT INTO job_observations
+                               (job_id,observed_at,scan_id,is_active,description_fingerprint,canonical_url,requisition_id)
+                               VALUES (?,?,?,?,?,?,?)""",
+                            (int(row["id"]), now, None, 0, previous[0], previous[1], previous[2]),
+                        )
             return newly_inactive
 
     def count_active_above(self, minimum_score: float, first_seen_scan_id: int | None = None) -> int:
@@ -572,6 +650,10 @@ class Database:
                    do_not_follow_up=?,application_date_unknown=?,skip_reason=? WHERE job_id=?""",
                 (normalized, datetime.now(timezone.utc).isoformat(), application_date, suppression, date_unknown,
                  skip_reason if normalized == "skipped" else None, job_id),
+            )
+            connection.execute(
+                "INSERT INTO application_status_history(job_id,status,changed_at) VALUES (?,?,?)",
+                (job_id, normalized, datetime.now(timezone.utc).isoformat()),
             )
             return cursor.rowcount == 1
 
