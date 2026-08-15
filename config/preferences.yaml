@@ -99,6 +99,16 @@ priority:
     application_effort: 0.02
   manual_review_penalty: 15
 
+analytics:
+  minimum_sample: 5
+
+company_saturation:
+  recent_window_days: 90
+  coherent_family_count: 2
+  active_warning: 3
+  moderate_threshold: 3
+  high_threshold: 7
+
 follow_up:
   minimum_business_days: 5
   urgent_business_days: 8

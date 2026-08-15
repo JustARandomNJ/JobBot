@@ -681,6 +681,31 @@ class Database:
             ).fetchall()
         return [dict(row) for row in rows]
 
+    def analytics_rows(self) -> list[dict[str, Any]]:
+        with self.connect() as connection:
+            rows = connection.execute(
+                """SELECT a.status,a.skip_reason,a.applied_at,j.company,j.source,j.date_posted,
+                          s.overall_score,s.priority_score,s.role_family,s.eligibility_status
+                   FROM application_status a JOIN jobs j ON j.id=a.job_id
+                   LEFT JOIN job_scores s ON s.job_id=j.id WHERE a.status NOT IN ('not reviewed','saved')"""
+            ).fetchall()
+        now = datetime.now(timezone.utc)
+        output = []
+        for raw in rows:
+            row = dict(raw)
+            def band(value: Any) -> str | None:
+                if value is None: return None
+                return "80-100" if value >= 80 else "60-79" if value >= 60 else "40-59" if value >= 40 else "0-39"
+            row["fit_band"] = band(row.get("overall_score")); row["priority_band"] = band(row.get("priority_score"))
+            if row.get("date_posted"):
+                posted = datetime.fromisoformat(row["date_posted"]); posted = posted if posted.tzinfo else posted.replace(tzinfo=timezone.utc)
+                days = max(0, (now-posted).days); row["freshness_band"] = "0-7 days" if days <= 7 else "8-30 days" if days <= 30 else "30+ days"
+            if row.get("applied_at"):
+                applied = datetime.fromisoformat(row["applied_at"]); applied = applied if applied.tzinfo else applied.replace(tzinfo=timezone.utc)
+                days = max(0, (now-applied).days); row["application_age_band"] = "0-14 days" if days <= 14 else "15-30 days" if days <= 30 else "30+ days"
+            output.append(row)
+        return output
+
     def add_contact(self, job_id: int, *, name: str, contact_type: str, role_title: str | None = None,
                     email: str | None = None, profile_url: str | None = None,
                     source: str | None = None, notes: str = "", verified: bool = False) -> int:
