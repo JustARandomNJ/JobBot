@@ -5,7 +5,8 @@ from storage.database import Database
 
 
 def add_scored_job(database: Database, external_id: str, score: float, *, active: bool = True,
-                   status: str = "not reviewed") -> int:
+                   status: str = "not reviewed", eligibility: str = "eligible",
+                   relevance: str = "unreviewed") -> int:
     job_id, _ = database.upsert_job(Job(
         source="ashby", external_id=external_id, company=f"Company {external_id}",
         title=f"Engineer {external_id}", apply_url=f"https://example.test/{external_id}",
@@ -13,13 +14,15 @@ def add_scored_job(database: Database, external_id: str, score: float, *, active
     database.save_score(job_id, JobScore(
         fit_score=score, competitiveness_score=score, preference_score=score,
         recency_score=score, priority_score=score, recommendation="Good match",
-        defense_eligibility_status="eligible",
+        defense_eligibility_status=eligibility, eligibility_status=eligibility,
     ))
     if status != "not reviewed":
         database.update_status(job_id, status)
     if not active:
         with database.connect() as connection:
             connection.execute("UPDATE jobs SET is_active=0 WHERE id=?", (job_id,))
+    if relevance != "unreviewed":
+        database.update_review(job_id, relevance)
     return job_id
 
 
@@ -36,6 +39,21 @@ def show_output(database_path, job_id: int, capsys) -> str:
 def top_job_outputs(output: str) -> list[str]:
     sections = output.rstrip().split("\n\n===== #")
     return [section.split("=====\n\n", 1)[1] for section in sections]
+
+
+def daily_ids(output: str) -> list[int]:
+    applications = output.split("Follow-ups worth doing today", 1)[0]
+    return [int(line.strip().split(" |", 1)[0].removeprefix("#"))
+            for line in applications.splitlines() if line.strip().startswith("#")]
+
+
+def run_daily(database_path, tmp_path, monkeypatch, capsys, *, target: int = 5) -> list[int]:
+    monkeypatch.setattr(app, "load_configuration", lambda _: ({}, {"follow_up": {}}, {}))
+    assert app.main([
+        "--database", str(database_path), "--config-dir", str(tmp_path),
+        "daily", "--target", str(target),
+    ]) == 0
+    return daily_ids(capsys.readouterr().out)
 
 
 def test_top_orders_by_score_and_defaults_to_five(tmp_path, capsys) -> None:
@@ -99,3 +117,72 @@ def test_top_uses_the_same_detailed_rendering_as_show(tmp_path, capsys) -> None:
     assert app.main(["--database", str(database_path), "top"]) == 0
 
     assert top_job_outputs(capsys.readouterr().out) == expected_outputs
+
+
+def test_daily_and_top_have_identical_ids_and_order(tmp_path, monkeypatch, capsys) -> None:
+    database_path = tmp_path / "jobs.db"
+    database = Database(database_path)
+    database.initialize()
+    expected = [add_scored_job(database, str(score), score) for score in (75, 95, 85, 65, 55, 45)]
+    expected = [expected[index] for index in (1, 2, 0, 3, 4)]
+
+    from_daily = run_daily(database_path, tmp_path, monkeypatch, capsys)
+    assert app.main(["--database", str(database_path), "top"]) == 0
+    from_top = output_ids(capsys.readouterr().out)
+
+    assert from_daily == from_top == expected
+
+
+def test_top_custom_limit_matches_daily_without_backfill(tmp_path, monkeypatch, capsys) -> None:
+    database_path = tmp_path / "jobs.db"
+    database = Database(database_path)
+    database.initialize()
+    recommended = [add_scored_job(database, f"valid-{score}", score) for score in (90, 80, 70, 60)]
+    add_scored_job(database, "reviewed", 100, relevance="strong match")
+    add_scored_job(database, "manual", 99, eligibility="manual_review")
+
+    from_daily = run_daily(database_path, tmp_path, monkeypatch, capsys, target=10)
+    assert app.main(["--database", str(database_path), "top", "--limit", "10"]) == 0
+
+    assert from_daily == output_ids(capsys.readouterr().out) == recommended
+
+
+@pytest.mark.parametrize("status", ["applied", "skipped"])
+def test_status_change_removes_job_from_daily_and_top(status, tmp_path, monkeypatch, capsys) -> None:
+    database_path = tmp_path / "jobs.db"
+    database = Database(database_path)
+    database.initialize()
+    removed = add_scored_job(database, "first", 100)
+    replacement = add_scored_job(database, "replacement", 90)
+    database.update_status(removed, status)
+
+    assert run_daily(database_path, tmp_path, monkeypatch, capsys) == [replacement]
+    assert app.main(["--database", str(database_path), "top"]) == 0
+    assert output_ids(capsys.readouterr().out) == [replacement]
+
+
+def test_daily_rules_exclude_inactive_ineligible_and_manual_review(tmp_path, monkeypatch, capsys) -> None:
+    database_path = tmp_path / "jobs.db"
+    database = Database(database_path)
+    database.initialize()
+    included = add_scored_job(database, "included", 50)
+    add_scored_job(database, "inactive", 100, active=False)
+    add_scored_job(database, "ineligible", 99, eligibility="ineligible")
+    add_scored_job(database, "manual", 98, eligibility="manual_review")
+
+    assert run_daily(database_path, tmp_path, monkeypatch, capsys) == [included]
+    assert app.main(["--database", str(database_path), "top"]) == 0
+    assert output_ids(capsys.readouterr().out) == [included]
+
+
+def test_top_delegates_selection_to_daily_recommendations(monkeypatch) -> None:
+    selected = [{"id": 42}]
+    database = object()
+    calls = []
+    monkeypatch.setattr(app, "get_daily_recommendations",
+                        lambda actual_database, limit: calls.append((actual_database, limit)) or selected)
+    monkeypatch.setattr(app, "render_detailed_jobs", lambda rows: calls.append(rows))
+
+    app.top_jobs(database, 7)
+
+    assert calls == [(database, 7), selected]

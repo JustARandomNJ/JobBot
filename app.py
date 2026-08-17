@@ -111,8 +111,10 @@ def build_parser() -> argparse.ArgumentParser:
     eligibility.add_argument("--eligible", action="store_const", const="eligible", dest="eligibility")
     eligibility.add_argument("--manual-eligibility-review", action="store_const", const="manual_review", dest="eligibility")
     eligibility.add_argument("--ineligible", action="store_const", const="ineligible", dest="eligibility")
-    top = commands.add_parser("top", help="Show the highest-ranked actionable jobs")
+    top = commands.add_parser("top", help="Show today's recommended applications in detail")
     top.add_argument("--limit", type=positive_int, default=5)
+    ranked = commands.add_parser("ranked", help="Show the globally highest-ranked actionable jobs")
+    ranked.add_argument("--limit", type=positive_int, default=5)
     show = commands.add_parser("show", help="Show a complete scoring breakdown")
     show.add_argument("job_id", type=int)
     package = commands.add_parser("package", help="Build a deterministic application package")
@@ -325,11 +327,15 @@ def list_jobs(database: Database, args: argparse.Namespace) -> None:
         print(f"{row['id']:>5}  {row['priority_score']:>5.1f} {row['fit_score']:>5.1f} {row['competitiveness_score']:>5.1f} {row['preference_score']:>5.1f} {row['recency_score']:>5.1f}  {row['defense_eligibility_status']:<24} {row['company']} - {row['title']}")
 
 
-def top_jobs(database: Database, limit: int) -> None:
-    rows = database.list_ranked_jobs(
-        active=True, limit=limit, eligibility="not_ineligible",
-        statuses=ACTIONABLE_APPLICATION_STATUSES,
-    )
+def get_daily_recommendations(database: Database, limit: int = 5) -> list[dict[str, Any]]:
+    """Return today's application recommendations in their display order."""
+    jobs = database.list_ranked_jobs(active=True, limit=None, eligibility="not_ineligible")
+    return [job for job in jobs if job["status"] in ACTIONABLE_APPLICATION_STATUSES
+            and job["relevance"] == "unreviewed"
+            and job["defense_eligibility_status"] != "manual_review"][:limit]
+
+
+def render_detailed_jobs(rows: list[dict[str, Any]]) -> None:
     total = len(rows)
     for rank, row in enumerate(rows, start=1):
         if rank > 1:
@@ -337,6 +343,18 @@ def top_jobs(database: Database, limit: int) -> None:
         print(f"===== #{row['id']} | Rank {rank}/{total} =====")
         print()
         show_job(row)
+
+
+def top_jobs(database: Database, limit: int) -> None:
+    render_detailed_jobs(get_daily_recommendations(database, limit))
+
+
+def ranked_jobs(database: Database, limit: int) -> None:
+    rows = database.list_ranked_jobs(
+        active=True, limit=limit, eligibility="not_ineligible",
+        statuses=ACTIONABLE_APPLICATION_STATUSES,
+    )
+    render_detailed_jobs(rows)
 
 
 def list_applications(database: Database, args: argparse.Namespace) -> None:
@@ -385,10 +403,7 @@ def print_follow_ups(rows: list[dict[str, Any]], *, show_all: bool = False,
 
 
 def daily(database: Database, config_dir: Path, target: int = 5) -> None:
-    jobs = database.list_ranked_jobs(active=True, limit=None, eligibility="not_ineligible")
-    submit = [job for job in jobs if job["status"] in {"not reviewed", "saved"}
-              and job["relevance"] == "unreviewed"
-              and job["defense_eligibility_status"] != "manual_review"][:target]
+    submit = get_daily_recommendations(database, target)
     followups = [row for row in follow_up_rows(database, config_dir) if row["due"]]
     candidates = follow_up_rows(database, config_dir, include_unapplied=True)
     attention = [row for row in candidates if row["category"] in {"attention", "recruiter_screen"}
@@ -602,6 +617,9 @@ def main(argv: list[str] | None = None) -> int:
     elif args.command == "top":
         database.initialize()
         top_jobs(database, args.limit)
+    elif args.command == "ranked":
+        database.initialize()
+        ranked_jobs(database, args.limit)
     elif args.command == "applications":
         database.initialize()
         list_applications(database, args)
